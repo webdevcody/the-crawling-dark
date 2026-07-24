@@ -1,5 +1,5 @@
 import type { WebSocket } from 'ws';
-import { createMoveState, type MoveState, type EntityKind } from '@crawling-dark/shared';
+import { createMoveState, STAMINA_MAX, type MoveState, type EntityKind } from '@crawling-dark/shared';
 
 /**
  * Authoritative server-side model of one connected client (M3 · t3a/t3b/t3c).
@@ -78,6 +78,31 @@ export class Player {
    * it stays `false` for them.
    */
   ready = false;
+
+  /* ---------------------------------------------------------------------- */
+  /* Stamina / sprint gating (M6 · t6b)                                     */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Server-authoritative sprint stamina, a fraction in `[0, STAMINA_MAX]`
+   * (1 = rested, 0 = spent). The {@link Room} drains it every tick the player is
+   * *actually* sprinting and regenerates it otherwise (clamped to that range),
+   * then ships it in the snapshot so the client HUD can draw the bar. Starts full
+   * and is reset to full on every round reset / turn (see
+   * {@link Room.clearCombatState}). The NPC never sprints, so its value simply
+   * stays at {@link STAMINA_MAX} and it always reports a full bar.
+   */
+  stamina = STAMINA_MAX;
+
+  /**
+   * Exhaustion latch. Set `true` the tick stamina hits 0; while it holds, the
+   * {@link Room} masks the {@link InputKey.Run} bit out of the keys it hands to
+   * the shared `step`, pinning the player to walk speed. It clears only once
+   * stamina has regenerated back up to {@link STAMINA_MIN_TO_SPRINT}, so a spent
+   * runner must rebuild a real buffer before sprint re-enables rather than
+   * flickering back on at the first regenerated tick.
+   */
+  exhausted = false;
 
   /* ---------------------------------------------------------------------- */
   /* Combat & infection state (M3)                                          */

@@ -458,6 +458,17 @@ function localTeam(entities: Map<number, InterpolatedEntity>): EntityKind | null
   return me ? me.kind : null;
 }
 
+/**
+ * Resolve the local player's server-authoritative stamina fraction (0..1) from
+ * its interpolated entity, or `null` if we haven't spawned yet (pre-WELCOME, or
+ * spectating). The HUD draws an empty, neutral bar for `null`.
+ */
+function localStamina(entities: Map<number, InterpolatedEntity>): number | null {
+  const localId = connection.playerId;
+  const me = localId !== null ? entities.get(localId) : undefined;
+  return me ? me.stamina : null;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Resize handling                                                            */
 /* -------------------------------------------------------------------------- */
@@ -549,6 +560,7 @@ function animate(): void {
     rttMs: connection.rttMs,
     tick: connection.tick,
     team: localTeam(entities),
+    stamina: localStamina(entities),
     ready: localReady,
     lookHint: controls.pointerLocked
       ? 'mouse: look (Esc releases)'

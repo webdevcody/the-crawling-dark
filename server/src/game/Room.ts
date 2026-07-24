@@ -21,6 +21,10 @@ import {
   BAT_KNOCKBACK,
   INFECTION_CONTACT_RADIUS,
   RESPAWN_DELAY_MS,
+  STAMINA_MAX,
+  STAMINA_DRAIN_PER_SEC,
+  STAMINA_REGEN_PER_SEC,
+  STAMINA_MIN_TO_SPRINT,
   generateWorld,
   collideCircleXZ,
   createMoveState,
@@ -413,7 +417,13 @@ export class Room {
     if (p.down) return;
 
     // Stunned players can't walk (input suppressed) but still fall and slide.
-    const keys = p.isStunned ? 0 : p.input.keys;
+    const rawKeys = p.isStunned ? 0 : p.input.keys;
+
+    // Advance sprint stamina and resolve exhaustion gating BEFORE stepping, so
+    // an out-of-stamina player is masked down to walk speed on this very tick.
+    // Returns the (possibly Run-masked) keys the shared `step` should see.
+    const keys = this.updateStamina(p, rawKeys);
+
     const next = step(p.move, { keys, yaw: p.input.yaw }, DT);
 
     // Apply then decay the horizontal knockback impulse (see Player.kvx/kvz).
@@ -432,6 +442,60 @@ export class Room {
     if (p.stunMs > 0) p.stunMs = Math.max(0, p.stunMs - TICK_MS);
     if (p.attackWindowMs > 0) p.attackWindowMs = Math.max(0, p.attackWindowMs - TICK_MS);
     if (p.down && p.respawnMs > 0) p.respawnMs = Math.max(0, p.respawnMs - TICK_MS);
+  }
+
+  /**
+   * Advance one player's sprint stamina for a single fixed tick and return the
+   * key bitmask the shared {@link step} should actually consume this tick (t6b).
+   *
+   * A player is *actually sprinting* only when EVERY condition holds: the Run bit
+   * is held, at least one direction key is held (holding Run while standing still
+   * costs nothing), they are not crawling (crawl already caps speed and beats Run
+   * in {@link moveSpeed}), they are grounded (no air-sprint), and they are not
+   * currently exhausted. Sprinting drains at {@link STAMINA_DRAIN_PER_SEC};
+   * everything else regenerates at {@link STAMINA_REGEN_PER_SEC}, both clamped to
+   * `[0, STAMINA_MAX]`.
+   *
+   * Exhaustion is a hysteresis latch: it arms the instant stamina reaches 0 and
+   * clears only once stamina has climbed back to {@link STAMINA_MIN_TO_SPRINT},
+   * so a spent runner stays pinned to walk speed until it has recovered a real
+   * buffer. While the latch is armed the Run bit is masked OUT of the returned
+   * keys, which makes {@link step} run at walk speed WITHOUT any change to
+   * `sim.ts` (the shared kinematics stay untouched — the gating lives here).
+   *
+   * Prediction note: the M6 t6a client prediction (a separate branch) runs the
+   * raw {@link step} with the UNMASKED keys, so at the exact instant of
+   * exhaustion the predicted position can momentarily overshoot the server's
+   * walk-speed result. Snapshot reconciliation corrects that within a frame or
+   * two; smoothing that single-tick blip is intentionally out of scope here.
+   */
+  private updateStamina(p: Player, keys: number): number {
+    // Mirror step()'s crawl latch so we agree on whether the player is crawling
+    // THIS tick: crawl mode only (re)evaluates while grounded, and a crawler is
+    // capped at crawl speed and can never sprint regardless of the Run bit.
+    const crawling = p.move.grounded ? hasKey(keys, InputKey.Crawl) : p.move.crawling;
+
+    const moving =
+      hasKey(keys, InputKey.Forward) ||
+      hasKey(keys, InputKey.Back) ||
+      hasKey(keys, InputKey.Left) ||
+      hasKey(keys, InputKey.Right);
+
+    const sprinting =
+      hasKey(keys, InputKey.Run) && moving && !crawling && p.move.grounded && !p.exhausted;
+
+    if (sprinting) {
+      p.stamina = Math.max(0, p.stamina - STAMINA_DRAIN_PER_SEC * DT);
+      // Empty this tick → latch exhausted so the mask below (and the next few
+      // ticks) pin the runner to walk speed until it recovers the buffer.
+      if (p.stamina <= 0) p.exhausted = true;
+    } else {
+      p.stamina = Math.min(STAMINA_MAX, p.stamina + STAMINA_REGEN_PER_SEC * DT);
+      if (p.exhausted && p.stamina >= STAMINA_MIN_TO_SPRINT) p.exhausted = false;
+    }
+
+    // While exhausted, strip Run so `step` moves at walk speed this tick.
+    return p.exhausted ? keys & ~InputKey.Run : keys;
   }
 
   /* ------------------------------------------------------------------------ */
@@ -877,6 +941,11 @@ export class Room {
     p.kvx = 0;
     p.kvz = 0;
     p.pendingAttack = false;
+    // Refill the stamina reserve and clear the exhaustion latch so a fresh round
+    // (or a newly-turned zombie) starts fully rested. resetPlayers() routes
+    // through here, so a new lobby resets stamina for everyone too.
+    p.stamina = STAMINA_MAX;
+    p.exhausted = false;
   }
 
   /** Buffer a gameplay event for inclusion in the next broadcast snapshot. */
@@ -908,6 +977,9 @@ export class Room {
         z: p.move.z,
         yaw: p.move.yaw,
         state: deriveState(p),
+        // Authoritative sprint reserve (0..1). The NPC never drains, so it
+        // reports full; the client HUD renders this as the stamina bar.
+        stamina: p.stamina,
       });
     }
 
