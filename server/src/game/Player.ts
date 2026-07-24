@@ -105,6 +105,24 @@ export class Player {
   exhausted = false;
 
   /* ---------------------------------------------------------------------- */
+  /* Interest management (M7 · t7c)                                         */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Ids of the entities this connection was sent in its *last* snapshot — the
+   * viewer's currently-visible set for per-client interest culling (M7 · t7c).
+   * The {@link Room} feeds this into {@link cullByInterest} each broadcast and
+   * stores the returned set back here, which is what powers the enter/exit
+   * hysteresis: an entity already in this set holds interest out to the wider
+   * exit radius, so an entity hovering on the boundary doesn't flicker in and out
+   * of the snapshot tick to tick. Starts empty (a fresh viewer has seen nothing),
+   * and naturally sheds stale ids because it is rebuilt from the live entity list
+   * every broadcast. Unused for spectators and the NPC, whose snapshots bypass
+   * the cull entirely.
+   */
+  visibleEntities: Set<number> = new Set();
+
+  /* ---------------------------------------------------------------------- */
   /* Combat & infection state (M3)                                          */
   /* ---------------------------------------------------------------------- */
 
