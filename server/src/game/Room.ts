@@ -21,6 +21,7 @@ import {
   BAT_KNOCKBACK,
   INFECTION_CONTACT_RADIUS,
   RESPAWN_DELAY_MS,
+  RECONNECT_GRACE_MS,
   STAMINA_MAX,
   STAMINA_DRAIN_PER_SEC,
   STAMINA_REGEN_PER_SEC,
@@ -37,6 +38,7 @@ import {
   type EntitySnapshot,
   type EntityState,
   type GameEvent,
+  type JoinMessage,
   type WelcomeMessage,
   type SnapshotMessage,
   type DeltaSnapshot,
@@ -150,6 +152,25 @@ export class Room {
   /** Next id to hand out. Only ever increments, so ids are never reused. */
   private nextPlayerId = 1;
 
+  /**
+   * Live reconnect sessions (M7 · t7d): every real client's session token mapped
+   * to its {@link Player}. Populated when {@link join} mints a token and torn
+   * down by {@link remove}, so a lookup here only ever resolves to a player
+   * still in the room (possibly one riding out its grace window). A reconnect's
+   * JOIN carries a token; matching it here is what lets us rebind the socket
+   * onto the original player instead of spawning a new one. The NPC has no token
+   * and never appears here.
+   */
+  private readonly sessions = new Map<string, Player>();
+
+  /**
+   * Monotonic nonce folded into each freshly minted session token (M7 · t7d).
+   * Only ever increments, so — combined with the never-reused player id — every
+   * token is unique without touching `Math.random` or the wall clock, keeping
+   * token minting deterministic and collision-free.
+   */
+  private tokenNonce = 0;
+
   /** Authoritative simulation tick counter, incremented once per fixed step. */
   private tick = 0;
 
@@ -230,7 +251,17 @@ export class Room {
   /**
    * Register a freshly connected socket: assign a distinct id, decide whether
    * it is a spectator (roster already at {@link MAX_PLAYERS}), place it on the
-   * spawn ring, store it, and send the one-shot {@link WelcomeMessage}.
+   * spawn ring, mint its reconnect session token, store it, and send the
+   * one-shot {@link WelcomeMessage}.
+   *
+   * Note (M7 · t7d): a reconnecting client ALSO lands here first — `ws` has no
+   * idea the socket belongs to a returning player, so `join` always creates a
+   * throwaway Player for the raw socket. The reclaim happens a beat later, when
+   * that socket's first JOIN arrives carrying a token (see {@link handleMessage}
+   * / {@link tryReconnect}), which migrates the live session onto the new socket
+   * and retires this throwaway. The WELCOME sent here (a fresh id/token) is
+   * therefore provisional on a reconnect and immediately superseded by the
+   * reclaim's WELCOME; on a first connect it is the real thing.
    */
   join(socket: WebSocket): Player {
     const id = this.nextPlayerId++;
@@ -241,22 +272,115 @@ export class Room {
     const spawn = spectator ? { x: 0, z: 0 } : this.spawnPoint(id);
 
     const player = new Player(id, socket, spectator, spawn.x, spawn.z);
+    player.token = this.mintToken(id);
     this.players.set(id, player);
+    this.sessions.set(player.token, player);
 
-    const welcome: WelcomeMessage = {
-      t: MessageType.Welcome,
-      playerId: id,
-      tickRate: TICK_RATE,
-      mapSeed: MAP_SEED,
-    };
-    this.send(player, welcome);
+    this.sendWelcome(player);
 
     return player;
   }
 
-  /** Remove a player from the room so it disappears from future snapshots. */
+  /**
+   * Mint a unique reconnect session token (M7 · t7d). The never-reused player id
+   * plus a monotonic {@link tokenNonce} guarantees uniqueness with no
+   * `Math.random` and no `Date.now`, so token creation stays deterministic.
+   */
+  private mintToken(id: number): string {
+    return `s${id}-${++this.tokenNonce}`;
+  }
+
+  /**
+   * Send a player its {@link WelcomeMessage} (id, tick rate, map seed, and the
+   * reconnect {@link Player.token}). Shared by {@link join} (first connect) and
+   * {@link tryReconnect} (reconnect resends the SAME id + token), so the wire
+   * contract stays in one place.
+   */
+  private sendWelcome(player: Player): void {
+    const welcome: WelcomeMessage = {
+      t: MessageType.Welcome,
+      playerId: player.id,
+      tickRate: TICK_RATE,
+      mapSeed: MAP_SEED,
+      token: player.token,
+    };
+    this.send(player, welcome);
+  }
+
+  /**
+   * Fully remove a player from the room so it disappears from future snapshots,
+   * and tear down its reconnect session so its token can no longer be reclaimed.
+   * This is the terminal removal path — reached by an immediate
+   * spectator/NPC/errored teardown and by grace-window expiry (see
+   * {@link disconnect} / {@link tickGrace}). A live client drop routes through
+   * {@link disconnect} first, which defers to here only once grace elapses.
+   */
   remove(player: Player): void {
     this.players.delete(player.id);
+    if (player.token !== '') this.sessions.delete(player.token);
+  }
+
+  /**
+   * Handle a socket close/error for a player (M7 · t7d). This is the
+   * grace-window-vs-immediate-remove decision the thin `ws` bridge defers to:
+   *
+   *  - a spectator (no entity to preserve) or the NPC is removed immediately,
+   *    keeping the pre-t7d behavior;
+   *  - an active, non-spectator player is NOT deleted. Instead it is frozen and
+   *    parked in the world for {@link RECONNECT_GRACE_MS}: mark it
+   *    {@link Player.disconnected}, arm {@link Player.graceMs}, drop the dead
+   *    socket (so {@link send} stops writing to it), and zero its held input so
+   *    the sim stands it idle rather than driving it on stale keys. The tick
+   *    loop counts the window down ({@link tickGrace}); a reconnect within it
+   *    reclaims the identity, otherwise it is finally {@link remove}d.
+   *
+   * Idempotent and migration-safe: it no-ops if `player` is no longer the live
+   * record for its id (e.g. it was already reclaimed onto a new socket, or
+   * already removed), so a late close event on a superseded socket does nothing.
+   */
+  disconnect(player: Player): void {
+    // Stale/superseded reference (already reclaimed or removed): ignore.
+    if (this.players.get(player.id) !== player) return;
+
+    // Spectators and the NPC have no identity worth holding open — drop now.
+    if (player.spectator || player.isNpc) {
+      this.remove(player);
+      return;
+    }
+
+    // Already in grace (a duplicate close/error): leave the running timer be.
+    if (player.disconnected) return;
+
+    player.disconnected = true;
+    player.graceMs = RECONNECT_GRACE_MS;
+    // The socket is gone; stop trying to write to it and let the sim freeze the
+    // body by treating the last held keys as released (keep the facing yaw so
+    // the idle pose points sensibly).
+    player.socket = null;
+    player.input = { keys: 0, yaw: player.input.yaw };
+    player.pendingAttack = false;
+  }
+
+  /**
+   * Age every dropped player's reconnect grace window by one fixed tick (t7d)
+   * and finalize any that ran out. Decrementing by {@link TICK_MS} keeps the
+   * countdown in lockstep with the sim, exactly like the combat timers. A
+   * player still {@link Player.disconnected} when its window hits 0 never
+   * reconnected, so it is removed through the normal {@link remove} path — its
+   * entity leaves the world and the round/win logic counts it gone. Expired
+   * players are collected first, then removed, so we never mutate the
+   * {@link players} map mid-iteration.
+   */
+  private tickGrace(): void {
+    let expired: Player[] | null = null;
+    for (const p of this.players.values()) {
+      if (!p.disconnected) continue;
+      p.graceMs = Math.max(0, p.graceMs - TICK_MS);
+      if (p.graceMs === 0) (expired ??= []).push(p);
+    }
+    if (expired !== null) {
+      for (const p of expired) this.remove(p);
+    }
   }
 
   /* ------------------------------------------------------------------------ */
@@ -264,18 +388,32 @@ export class Room {
   /* ------------------------------------------------------------------------ */
 
   /**
-   * Decode and dispatch one client frame. Unknown or not-yet-implemented
-   * messages (READY) are ignored; they land in later milestones.
+   * Decode and dispatch one client frame. Unknown messages are ignored.
+   *
+   * Returns the *effective* player the caller should route subsequent frames
+   * (and the eventual disconnect) to (M7 · t7d). This matters only for JOIN: a
+   * JOIN carrying a valid reconnect token migrates this socket onto a
+   * still-present, in-grace player and returns THAT player, so the thin `ws`
+   * bridge can re-point its per-socket closures at the restored identity. Every
+   * other message — and any JOIN that does not reconnect — returns `player`
+   * unchanged.
    */
-  handleMessage(player: Player, data: WireData): void {
+  handleMessage(player: Player, data: WireData): Player {
     const msg = decodeClientMessage(data);
-    if (msg === null) return;
+    if (msg === null) return player;
 
     switch (msg.t) {
-      case MessageType.Join:
-        // Store the display name; identity for scoreboards/HUD.
-        player.name = msg.name;
-        break;
+      case MessageType.Join: {
+        // Reconnect (t7d): a JOIN whose token matches a still-present, in-grace
+        // player reclaims that identity — rebinding it onto THIS socket and
+        // retiring the throwaway `join` made — otherwise this is a normal first
+        // join and `player` stands. Either way, record the display name and
+        // return the effective player so the bridge routes the rest of the
+        // session (and the next disconnect) to it.
+        const effective = this.tryReconnect(player, msg) ?? player;
+        effective.name = msg.name;
+        return effective;
+      }
 
       case MessageType.Input:
         // t1e: record the latest input; movement is applied by the tick loop.
@@ -322,6 +460,79 @@ export class Room {
         // Unknown / server-only message tags are ignored.
         break;
     }
+
+    return player;
+  }
+
+  /**
+   * Reconnect matching + socket migration (M7 · t7d). `throwaway` is the fresh
+   * Player {@link join} created for the raw reconnecting socket; `msg` is that
+   * socket's first JOIN. If the JOIN carries a token that resolves to a
+   * DIFFERENT, still-present player whose client has gone (in its grace window,
+   * or holding a socket that is no longer open), migrate the live session onto
+   * the new socket and return the restored player; otherwise return `null` so
+   * the caller falls back to treating `throwaway` as a brand-new join.
+   *
+   * The migration keeps the restored player's id, team, position, and combat
+   * state intact; it only swaps in the new socket, clears the grace flags,
+   * stands it idle (the client resumes INPUT immediately), retires the
+   * throwaway placeholder, and resends WELCOME so the client re-adopts its
+   * ORIGINAL id + token. Snapshots to the rebound socket resume on the next
+   * broadcast tick, and because every snapshot in this worktree is a full state
+   * dump, that IS the full-state resync (a rebound client has no acked baseline
+   * to delta against, so the same holds once binary delta encoding lands).
+   */
+  private tryReconnect(throwaway: Player, msg: JoinMessage): Player | null {
+    if (msg.token === undefined) return null;
+
+    const restored = this.sessions.get(msg.token);
+    if (restored === undefined || restored === throwaway) return null;
+    // Only reclaim a player whose live record still exists and whose client is
+    // actually gone. This rejects a token whose owner is still connected (so a
+    // leaked/replayed token can't hijack an active session) — that falls back
+    // to a normal new-player join.
+    if (this.players.get(restored.id) !== restored) return null;
+    if (!this.isReclaimable(restored)) return null;
+
+    // Migrate: hand the fresh socket to the restored player and clear grace.
+    restored.socket = throwaway.socket;
+    restored.disconnected = false;
+    restored.graceMs = 0;
+    // Reset the delta-snapshot baseline (M7 · t7a/t7b × t7d integration): the
+    // reconnecting client cleared its own snapshot history on the drop, and any
+    // frames the server "sent" during the grace window went to a null socket and
+    // were never received. Any pre-drop baseline is therefore worthless — drop
+    // it so the next sendSnapshotTo takes the FULL-frame path (the full state
+    // resync t7d promises), after which delta encoding resumes cleanly against
+    // post-reconnect ticks the client actually acks.
+    restored.lastSnapAck = undefined;
+    restored.sentSnapshots.clear();
+    // Stand idle until the client's first post-reconnect INPUT lands, so we
+    // don't resume on whatever keys were held at the drop; keep the facing yaw.
+    restored.input = { keys: 0, yaw: restored.input.yaw };
+    restored.pendingAttack = false;
+
+    // Retire the throwaway placeholder join() created for this socket (drops it
+    // from the roster and its short-lived session token).
+    this.remove(throwaway);
+
+    // Re-issue WELCOME over the new socket: same id + same token, so the client
+    // re-adopts its original identity and the next snapshot is a full resync.
+    this.sendWelcome(restored);
+
+    return restored;
+  }
+
+  /**
+   * Whether a session may be reclaimed by a reconnect (M7 · t7d): the normal
+   * case is a player sitting in its {@link Player.disconnected} grace window,
+   * but we also accept one still flagged connected yet holding a socket that is
+   * no longer OPEN — a drop the close handler hasn't processed yet — so a fast
+   * reconnect that races the old socket's close still restores identity.
+   */
+  private isReclaimable(p: Player): boolean {
+    if (p.disconnected) return true;
+    return p.socket === null || p.socket.readyState !== WebSocket.OPEN;
   }
 
   /* ------------------------------------------------------------------------ */
@@ -385,6 +596,11 @@ export class Room {
    * (e.g. a last human downed this very tick already reads as turned).
    */
   private step(): void {
+    // Step 1 (t7d) — age every dropped player's reconnect grace window and
+    // finalize any that expired, BEFORE integration/combat/round so a forfeit
+    // this tick is reflected in the win/lose evaluation below.
+    this.tickGrace();
+
     // Step 2 — integrate the human-controlled players from their inputs. This
     // runs in every phase so players can mill about the lobby / countdown.
     for (const p of this.players.values()) {

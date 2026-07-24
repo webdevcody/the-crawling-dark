@@ -30,6 +30,7 @@ import {
   type EntitySnapshot,
   type GameEvent,
   type InputMessage,
+  type JoinMessage,
   type RoundMessage,
 } from '@crawling-dark/shared';
 
@@ -147,6 +148,16 @@ export class Connection {
 
   /** Deterministic town seed from WELCOME. `null` until the first WELCOME. */
   private mapSeedValue: number | null = null;
+
+  /**
+   * Reconnect session token from the most recent WELCOME (M7 · t7d), or `null`
+   * before the first one. It is echoed back in the JOIN on EVERY (re)open so a
+   * reconnect presents it and the server can restore our original id/team; a
+   * first connect sends no token. Deliberately NOT cleared on socket close — it
+   * must survive the drop so the auto-reconnect can hand it back — so it
+   * persists across the whole session and only ever advances to a newer token.
+   */
+  private sessionToken: string | null = null;
 
   /** Latest server tick seen in a SNAPSHOT. */
   private serverTick = 0;
@@ -334,7 +345,12 @@ export class Connection {
   private handleOpen(): void {
     this.statusValue = 'open';
     this.reconnectAttempts = 0;
-    this.send({ t: MessageType.Join, name: this.name });
+    // Announce ourselves. On a reconnect we carry the token from our last
+    // WELCOME so the server can reclaim our original identity/team within its
+    // grace window (M7 · t7d); a first connect has no token and gets a fresh id.
+    const join: JoinMessage = { t: MessageType.Join, name: this.name };
+    if (this.sessionToken !== null) join.token = this.sessionToken;
+    this.send(join);
     this.startPingLoop();
   }
 
@@ -399,6 +415,10 @@ export class Connection {
       case MessageType.Welcome:
         this.ownId = msg.playerId;
         this.mapSeedValue = msg.mapSeed;
+        // Persist the reconnect token so the next (re)open can present it and
+        // reclaim this identity (t7d). On a reconnect the server re-issues the
+        // SAME token here alongside the SAME playerId.
+        this.sessionToken = msg.token;
         break;
 
       case MessageType.Snapshot:

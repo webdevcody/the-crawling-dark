@@ -48,11 +48,51 @@ export class Player {
    * The underlying `ws` socket used to push messages to this client, or `null`
    * for a server-spawned NPC (the M4 patient-zero zombie), which has no client
    * to talk to. {@link Room.send} skips any player whose socket is `null`.
+   *
+   * REBINDABLE (M7 · t7d): no longer `readonly`. On a reconnect the {@link Room}
+   * hands this player a brand-new socket (the fresh connection) in place of the
+   * dead one, so the *same* Player — id, team, position, combat state — keeps
+   * talking to the client over the new pipe. It is also nulled the moment a
+   * drop is detected (while the player sits in its grace window) so the server
+   * never tries to write to a closed socket.
    */
-  readonly socket: WebSocket | null;
+  socket: WebSocket | null;
 
   /** Display name claimed via {@link JoinMessage}; empty until a JOIN arrives. */
   name = '';
+
+  /* ---------------------------------------------------------------------- */
+  /* Reconnect / session (M7 · t7d)                                         */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Opaque, room-unique session token minted by the {@link Room} on first join
+   * and shipped in this player's {@link WelcomeMessage}. A later {@link
+   * JoinMessage} echoing this exact token lets the room reclaim this identity
+   * (rebind {@link socket}, keep id/team/position/combat) instead of spawning a
+   * new player. Empty string for the NPC, which has no client and never
+   * reconnects. Stays constant across a reconnect — the same token is re-issued.
+   */
+  token = '';
+
+  /**
+   * True while this player is inside its post-drop grace window: the socket has
+   * closed but the entity is deliberately kept in the world (so teammates still
+   * see it) awaiting a possible reconnect. While set, the {@link Room} freezes
+   * the player — {@link input} is zeroed so it stands idle rather than acting on
+   * the last held keys — and counts {@link graceMs} down each tick. Cleared when
+   * the client reconnects; if the timer instead reaches 0 the player is removed.
+   */
+  disconnected = false;
+
+  /**
+   * Remaining grace time in milliseconds while {@link disconnected} (0 = none
+   * pending). Seeded to {@link RECONNECT_GRACE_MS} on a detected drop and
+   * decremented by one {@link TICK_MS} per tick in lockstep with the sim, just
+   * like the combat timers. When it hits 0 without a reconnect the {@link Room}
+   * removes the player through the normal path so round/win logic sees it leave.
+   */
+  graceMs = 0;
 
   /**
    * Authoritative kinematic state (position, facing, vertical velocity, and the
