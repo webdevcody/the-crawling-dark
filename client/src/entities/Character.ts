@@ -73,6 +73,14 @@ export interface CharacterModel {
   readonly root: THREE.Object3D;
 
   /**
+   * The body's current team. The caller reads this to detect a mid-round `kind`
+   * flip (a human turning into a zombie keeps its id) and re-run {@link setTeam}
+   * so the infection visibly recolors/reshapes the body. Mutated internally by
+   * {@link setTeam}; treated as read-only by the caller.
+   */
+  readonly kind: EntityKind;
+
+  /**
    * Paint the body for its team and rebuild its silhouette (humans upright,
    * zombies hunched). Called on spawn and again whenever an entity's `kind`
    * flips mid-round (a human turning into a zombie keeps its id), which is what
