@@ -1117,6 +1117,7 @@ function animate(): void {
         const z = ev.z ?? tgt?.z ?? 0;
         spawnInfectVfx(x, y, z);
         audio.infect({ x, y, z }); // infection stinger at the victim
+        audio.duck(); // dip music/ambient so the stinger reads (t12e)
         pushFeedLine(`Player #${ev.targetId ?? '?'} was turned 🧟`);
         break;
       }
@@ -1133,12 +1134,14 @@ function animate(): void {
       case 'roundStart': {
         // A rising horn to open the match. Non-positional: centred on the player.
         audio.roundStart(listenerAnchor(entities));
+        audio.duck(); // dip the beds so the opening horn reads (t12e)
         break;
       }
       case 'roundEnd': {
         // A closing sting, varied by who won (bright human triad vs dark zombie
         // cluster). Winner rides on the ROUND message, not the event itself.
         audio.roundEnd(listenerAnchor(entities), connection.round?.winner);
+        audio.duck(0.28); // deeper dip so the closing sting lands (t12e)
         break;
       }
       default:

@@ -68,6 +68,8 @@ interface Spatial {
   pan: number;
   /** Distance attenuation in (0, 1], from `1 / (1 + d / REF_DIST)`. */
   gain: number;
+  /** Air-absorption low-pass cutoff (Hz): high, ~transparent near; low when far. */
+  cutoff: number;
 }
 
 /** Reference distance (m) at which distance gain has fallen to one half. */
@@ -76,13 +78,24 @@ const REF_DIST = 7;
 /** Hard cull radius (m): sources beyond this are silent (and never synthesized). */
 const MAX_AUDIBLE = 42;
 
+/** Air-absorption low-pass cutoff (Hz): near the listener, and out at {@link MAX_AUDIBLE} (t12e). */
+const AIR_CUTOFF_NEAR = 20000;
+const AIR_CUTOFF_FAR = 2600;
+
+/** Sidechain ducking (t12e): how far the music/ambient beds dip under a stinger. */
+const DUCK_MUSIC = 0.35; // music floor while ducked (lower = deeper dip)
+const DUCK_AMBIENT = 0.6; // ambient dips less than music
+const DUCK_ATTACK = 0.05; // seconds to reach the floor
+const DUCK_HOLD = 0.16; // seconds held at the floor
+const DUCK_RELEASE = 0.55; // seconds to recover to unity
+
 /** Default bus volumes (0..1); overridable via the setters + on-screen controls. */
 const DEFAULT_MASTER = 0.8;
 const DEFAULT_SFX = 0.9;
-const DEFAULT_MUSIC = 0.55;
+const DEFAULT_MUSIC = 0.5;
 
 /** Fixed level of the looping ambient bed, relative to the master bus. */
-const AMBIENT_LEVEL = 0.6;
+const AMBIENT_LEVEL = 0.5;
 
 /* -- Music bed (M12 · t12c): a synth pad/pulse layer with dynamic intensity -- */
 
@@ -207,6 +220,12 @@ export class AudioEngine {
   private ambientGain: GainNode | null = null;
   /** Music sub-bus (the dynamic-intensity bed routes here), scaled by {@link musicVolume}. */
   private musicGain: GainNode | null = null;
+  /** Master limiter (t12e): tames peaks so stacked SFX + music never hard-clip. */
+  private limiter: DynamicsCompressorNode | null = null;
+  /** Duck stage on the music bus (automated by {@link duck}; unity at rest). */
+  private musicDuckGain: GainNode | null = null;
+  /** Duck stage on the ambient bus (automated by {@link duck}; unity at rest). */
+  private ambientDuckGain: GainNode | null = null;
 
   /** Cached white-noise buffer reused by every filtered-noise voice. */
   private noiseBuffer: AudioBuffer | null = null;
@@ -275,23 +294,42 @@ export class AudioEngine {
     if (!Ctor) return; // no Web Audio → the engine stays silent.
     const ctx = new Ctor();
 
+    // Master bus → a gentle limiter → destination (t12e). The limiter buys the
+    // mix headroom so a busy horde of SFX stacked over the music bed and a
+    // stinger can't drive the summed output into hard clipping.
     const master = ctx.createGain();
-    master.connect(ctx.destination);
+    const limiter = ctx.createDynamicsCompressor();
+    limiter.threshold.value = -6; // start taming above -6 dBFS
+    limiter.knee.value = 6;
+    limiter.ratio.value = 12; // brick-wall-ish on peaks
+    limiter.attack.value = 0.004;
+    limiter.release.value = 0.18;
+    master.connect(limiter).connect(ctx.destination);
 
     const sfx = ctx.createGain();
     sfx.connect(master);
 
+    // Ambient + music each route through their own DUCK stage (unity at rest)
+    // before the master, so {@link duck} can momentarily dip the beds under a
+    // stinger without fighting the user's volume on ambientGain / musicGain.
+    const ambientDuck = ctx.createGain();
+    ambientDuck.connect(master);
     const ambient = ctx.createGain();
-    ambient.connect(master);
+    ambient.connect(ambientDuck);
 
+    const musicDuck = ctx.createGain();
+    musicDuck.connect(master);
     const music = ctx.createGain();
-    music.connect(master);
+    music.connect(musicDuck);
 
     this.ctx = ctx;
     this.masterGain = master;
+    this.limiter = limiter;
     this.sfxGain = sfx;
     this.ambientGain = ambient;
+    this.ambientDuckGain = ambientDuck;
     this.musicGain = music;
+    this.musicDuckGain = musicDuck;
     this.noiseBuffer = this.makeNoise(ctx, 1.5);
 
     // Kick off sample loading (t12a). Async + fire-and-forget: one-shots synth-
@@ -321,6 +359,10 @@ export class AudioEngine {
     this.musicTenseGain = null;
     this.musicPulseGain = null;
     this.musicPulseLfo = null;
+    // Mix stages (M12 · t12e).
+    this.limiter = null;
+    this.musicDuckGain = null;
+    this.ambientDuckGain = null;
   }
 
   /* ---- Volume + mute ---------------------------------------------------- */
@@ -382,6 +424,36 @@ export class AudioEngine {
     if (!this.ambientStarted) {
       // Hold the bed muted until it actually starts, then it fades in itself.
       this.ambientGain?.gain.setValueAtTime(0, now);
+    }
+  }
+
+  /* ---- Ducking (mix sidechain) ------------------------------------------ */
+
+  /**
+   * Momentarily dip the music + ambient beds so a key stinger (an infection, a
+   * round transition) cuts cleanly through the mix, then recover — a classic
+   * sidechain "duck" (t12e). It automates the dedicated duck stages built in
+   * {@link build}, so it never fights the user's music/ambient volume on the bus
+   * gains. No-op before the context exists. `depth` sets how far the music bed
+   * dips (0..1; lower = deeper); the ambient bed dips proportionally less.
+   */
+  duck(depth = DUCK_MUSIC): void {
+    const ctx = this.ctx;
+    if (ctx === null) return;
+    const now = ctx.currentTime;
+    const musicFloor = clamp(depth, 0, 1);
+    // Preserve the music-vs-ambient dip ratio when a caller overrides `depth`.
+    const ambientFloor = clamp(depth + (DUCK_AMBIENT - DUCK_MUSIC), 0, 1);
+    for (const [g, floor] of [
+      [this.musicDuckGain, musicFloor],
+      [this.ambientDuckGain, ambientFloor],
+    ] as const) {
+      if (g === null) continue;
+      g.gain.cancelScheduledValues(now);
+      g.gain.setValueAtTime(g.gain.value, now);
+      g.gain.linearRampToValueAtTime(floor, now + DUCK_ATTACK);
+      g.gain.setValueAtTime(floor, now + DUCK_ATTACK + DUCK_HOLD);
+      g.gain.linearRampToValueAtTime(1, now + DUCK_ATTACK + DUCK_HOLD + DUCK_RELEASE);
     }
   }
 
@@ -1206,9 +1278,17 @@ export class AudioEngine {
     const t0 = ctx.currentTime;
     const panner = ctx.createStereoPanner();
     panner.pan.value = s.pan;
+    // Distance low-pass (t12e): a cheap air-absorption model for depth. We keep
+    // the custom stereo panner (it already tracks the look yaw and is far
+    // simpler than migrating every one-shot to an HRTF PositionalAudio); this
+    // filter supplies most of the missing front/back "distance" cue.
+    const air = ctx.createBiquadFilter();
+    air.type = 'lowpass';
+    air.frequency.value = s.cutoff;
+    air.Q.value = 0.5;
     const distance = ctx.createGain();
     distance.gain.value = s.gain;
-    panner.connect(distance).connect(this.sfxGain);
+    panner.connect(air).connect(distance).connect(this.sfxGain);
 
     const sources = build(ctx, t0, panner);
 
@@ -1220,6 +1300,11 @@ export class AudioEngine {
       done = true;
       try {
         panner.disconnect();
+      } catch {
+        /* already detached */
+      }
+      try {
+        air.disconnect();
       } catch {
         /* already detached */
       }
@@ -1247,6 +1332,12 @@ export class AudioEngine {
 
     const gain = 1 / (1 + dist / REF_DIST);
 
+    // Air absorption (t12e): high frequencies wash out with distance, so far
+    // sources read duller/deeper. Interpolate the low-pass cutoff across the
+    // audible band; near sources stay ~transparent (up at AIR_CUTOFF_NEAR).
+    const cutoff =
+      AIR_CUTOFF_NEAR + (AIR_CUTOFF_FAR - AIR_CUTOFF_NEAR) * clamp(dist / MAX_AUDIBLE, 0, 1);
+
     // Right-hand vector for the listener's facing is (cos y, -sin y); the
     // horizontal bearing's sine (right component / horizontal distance) makes a
     // natural stereo pan that responds as you turn.
@@ -1257,7 +1348,7 @@ export class AudioEngine {
       pan = clamp((rightComp / horiz) * 0.9, -1, 1);
     }
 
-    return { pan, gain };
+    return { pan, gain, cutoff };
   }
 
   /* ---- Synthesis helpers ------------------------------------------------ */
