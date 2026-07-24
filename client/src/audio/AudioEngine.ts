@@ -53,6 +53,14 @@ export interface Point3 {
 /** Movement states that produce footsteps, mirroring the sim's {@link EntityState}. */
 export type FootstepKind = 'walk' | 'run' | 'crawl';
 
+/**
+ * The ground a step lands on, chosen by the caller from world data (t12b): hard
+ * paving (`'stone'`), soft outskirts earth (`'dirt'`), or the lake's edge
+ * (`'wet'`). It nudges a step's cutoff/level/pitch and, on `'wet'`, adds a short
+ * bright splash — see {@link SURFACE} and {@link AudioEngine.footstep}.
+ */
+export type FootstepSurface = 'stone' | 'dirt' | 'wet';
+
 /** Result of projecting a source position into a stereo pan + distance gain. */
 interface Spatial {
   /** Stereo pan in [-1, 1] (left → right), from the listener-relative bearing. */
@@ -87,6 +95,27 @@ const FOOTSTEP: Readonly<Record<FootstepKind, {
   run: { rate: 1.25, freq: 1300, peak: 0.72, dur: 0.09 },
   // Muffled, low, and soft — dragging along the ground.
   crawl: { rate: 0.8, freq: 520, peak: 0.34, dur: 0.16 },
+};
+
+/**
+ * Per-surface tweaks layered on top of {@link FOOTSTEP} (t12b). Each field is a
+ * multiplier on the step's playback rate / low-pass cutoff / level, plus a
+ * `splash` level (0 = none) for a short high band of noise on top — the give-away
+ * of a wet edge. `'stone'` is the neutral identity so existing behaviour is
+ * unchanged when no surface is supplied.
+ */
+const SURFACE: Readonly<Record<FootstepSurface, {
+  rate: number;
+  freq: number;
+  peak: number;
+  splash: number;
+}>> = {
+  // Hard paving: bright and sharp — the default identity (all ×1).
+  stone: { rate: 1.0, freq: 1.0, peak: 1.0, splash: 0.0 },
+  // Soft outskirts earth: darker, quieter, a touch slower — a muffled scuff.
+  dirt: { rate: 0.95, freq: 0.6, peak: 0.82, splash: 0.0 },
+  // The lake's edge: damped body plus a bright little splash of displaced water.
+  wet: { rate: 0.92, freq: 0.78, peak: 0.9, splash: 0.4 },
 };
 
 /** Clamp `x` into the inclusive range [`lo`, `hi`]. */
@@ -424,18 +453,21 @@ export class AudioEngine {
     // Real sample if present (t12a); otherwise the synth whoosh below.
     if (this.playBuffer('swing', pos, { rate: 0.97 + Math.random() * 0.06 })) return;
     this.oneShot(pos, (ctx, t0, dest) => {
+      // Per-swing variety (t12b) so a flurry of bat hits never sounds identical:
+      // jitter the noise pitch, the sweep's peak + timing, and its landing tone.
+      const vary = 0.9 + Math.random() * 0.2;
       const src = ctx.createBufferSource();
       src.buffer = this.noiseBuffer;
-      src.playbackRate.value = 1.1;
+      src.playbackRate.value = 1.1 * vary;
 
       const bp = ctx.createBiquadFilter();
       bp.type = 'bandpass';
       bp.Q.value = 1.1;
-      bp.frequency.setValueAtTime(400, t0);
-      bp.frequency.exponentialRampToValueAtTime(1800, t0 + 0.09);
-      bp.frequency.exponentialRampToValueAtTime(500, t0 + 0.24);
+      bp.frequency.setValueAtTime(360 + Math.random() * 90, t0);
+      bp.frequency.exponentialRampToValueAtTime(1600 + Math.random() * 500, t0 + 0.08 + Math.random() * 0.03);
+      bp.frequency.exponentialRampToValueAtTime(460 + Math.random() * 90, t0 + 0.24);
 
-      const env = this.env(ctx, t0, 0.02, 0.22, 0.5);
+      const env = this.env(ctx, t0, 0.02, 0.22, 0.44 + Math.random() * 0.12);
       src.connect(bp).connect(env).connect(dest);
 
       src.start(t0, Math.random() * 0.5);
@@ -540,24 +572,33 @@ export class AudioEngine {
    * level, and length vary by {@link FootstepKind} (see {@link FOOTSTEP}), with a
    * little per-step jitter and a random slice of the noise buffer so no two steps
    * sound identical. Positioned at the stepping entity.
+   *
+   * `surface` (t12b) tilts the character by ground type (see {@link SURFACE}):
+   * hard `'stone'` (the default identity), softer/darker `'dirt'` on the
+   * outskirts, and damped `'wet'` at the lake edge — the last also layering a
+   * short bright splash on top. A surface-specific sample (`footstep_<surface>`)
+   * is tried first, then the generic `footstep` sample, then the synth voice.
    */
-  footstep(pos: Point3, kind: FootstepKind): void {
+  footstep(pos: Point3, kind: FootstepKind, surface: FootstepSurface = 'stone'): void {
     const p = FOOTSTEP[kind];
-    // Real sample if present (t12a): reuse the per-kind rate + relative level;
-    // otherwise fall through to the synthesized thud below.
-    const rate = p.rate * (0.94 + Math.random() * 0.12);
-    if (this.playBuffer('footstep', pos, { rate, gain: p.peak / 0.85 })) return;
+    const sm = SURFACE[surface];
+    // Real sample if present (t12a): reuse the per-kind rate + relative level,
+    // shaped by the surface; otherwise fall through to the synthesized thud.
+    const rate = p.rate * sm.rate * (0.94 + Math.random() * 0.12);
+    const gain = (p.peak * sm.peak) / 0.85;
+    if (surface !== 'stone' && this.playBuffer(`footstep_${surface}`, pos, { rate, gain })) return;
+    if (this.playBuffer('footstep', pos, { rate, gain })) return;
     this.oneShot(pos, (ctx, t0, dest) => {
       const src = ctx.createBufferSource();
       src.buffer = this.noiseBuffer;
-      src.playbackRate.value = p.rate * (0.94 + Math.random() * 0.12);
+      src.playbackRate.value = p.rate * sm.rate * (0.94 + Math.random() * 0.12);
 
       const lp = ctx.createBiquadFilter();
       lp.type = 'lowpass';
-      lp.frequency.value = p.freq * (0.9 + Math.random() * 0.2);
+      lp.frequency.value = p.freq * sm.freq * (0.9 + Math.random() * 0.2);
       lp.Q.value = 0.9;
 
-      const env = this.env(ctx, t0, 0.004, p.dur, p.peak * (0.85 + Math.random() * 0.3));
+      const env = this.env(ctx, t0, 0.004, p.dur, p.peak * sm.peak * (0.85 + Math.random() * 0.3));
       src.connect(lp).connect(env).connect(dest);
 
       // A random offset into the noise gives each step a distinct grain.
@@ -565,7 +606,306 @@ export class AudioEngine {
       const off = buf ? Math.random() * Math.max(0, buf.duration - p.dur - 0.02) : 0;
       src.start(t0, off);
       src.stop(t0 + p.dur + 0.02);
-      return [src];
+      const sources: AudioScheduledSourceNode[] = [src];
+
+      // Wet ground: a short, bright band of noise on top — displaced water.
+      if (sm.splash > 0) {
+        const spl = ctx.createBufferSource();
+        spl.buffer = this.noiseBuffer;
+        const bp = ctx.createBiquadFilter();
+        bp.type = 'bandpass';
+        bp.Q.value = 0.7;
+        bp.frequency.setValueAtTime(1400, t0);
+        bp.frequency.exponentialRampToValueAtTime(3200, t0 + 0.05);
+        const splEnv = this.env(ctx, t0, 0.003, 0.09, sm.splash * p.peak);
+        spl.connect(bp).connect(splEnv).connect(dest);
+        spl.start(t0, Math.random() * 0.5);
+        spl.stop(t0 + 0.11);
+        sources.push(spl);
+      }
+      return sources;
+    });
+  }
+
+  /**
+   * A **jump** take-off (t12b): a short upward whoosh of band-passed noise (the
+   * air of the leap) layered with a brief low triangle "grunt" of effort. Driven
+   * off the server `'jump'` event, positioned at the jumper.
+   */
+  jump(pos: Point3): void {
+    // Real sample if present; otherwise the synth whoosh + grunt below.
+    if (this.playBuffer('jump', pos, { rate: 0.96 + Math.random() * 0.08 })) return;
+    this.oneShot(pos, (ctx, t0, dest) => {
+      // Whoosh: a band of noise sweeping upward as the body launches.
+      const air = ctx.createBufferSource();
+      air.buffer = this.noiseBuffer;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.Q.value = 0.9;
+      bp.frequency.setValueAtTime(300, t0);
+      bp.frequency.exponentialRampToValueAtTime(1300, t0 + 0.16);
+      const airEnv = this.env(ctx, t0, 0.02, 0.16, 0.28);
+      air.connect(bp).connect(airEnv).connect(dest);
+      air.start(t0, Math.random() * 0.5);
+      air.stop(t0 + 0.2);
+
+      // Grunt: a short low triangle blip for the effort of the leap.
+      const grunt = ctx.createOscillator();
+      grunt.type = 'triangle';
+      grunt.frequency.setValueAtTime(180, t0);
+      grunt.frequency.exponentialRampToValueAtTime(120, t0 + 0.12);
+      const gruntEnv = this.env(ctx, t0, 0.01, 0.13, 0.3);
+      grunt.connect(gruntEnv).connect(dest);
+      grunt.start(t0);
+      grunt.stop(t0 + 0.16);
+      return [air, grunt];
+    });
+  }
+
+  /**
+   * A **landing** thud (t12b): a low sine that snaps down (the weight hitting
+   * the ground) under a soft low band of noise (the scuff of contact). Fired
+   * when an entity leaves the `'jump'` state; positioned at the lander.
+   */
+  land(pos: Point3): void {
+    // Real sample if present; otherwise the synth thud below.
+    if (this.playBuffer('land', pos)) return;
+    this.oneShot(pos, (ctx, t0, dest) => {
+      // Body: a low sine snapping downward — the mass touching down.
+      const body = ctx.createOscillator();
+      body.type = 'sine';
+      body.frequency.setValueAtTime(120, t0);
+      body.frequency.exponentialRampToValueAtTime(48, t0 + 0.11);
+      const bodyEnv = this.env(ctx, t0, 0.003, 0.14, 0.6);
+      body.connect(bodyEnv).connect(dest);
+      body.start(t0);
+      body.stop(t0 + 0.18);
+
+      // Scuff: a low band of noise for the grit of the ground contact.
+      const scuff = ctx.createBufferSource();
+      scuff.buffer = this.noiseBuffer;
+      const lp = ctx.createBiquadFilter();
+      lp.type = 'lowpass';
+      lp.frequency.value = 700;
+      const scuffEnv = this.env(ctx, t0, 0.003, 0.1, 0.34);
+      scuff.connect(lp).connect(scuffEnv).connect(dest);
+      scuff.start(t0, Math.random() * 0.5);
+      scuff.stop(t0 + 0.12);
+      return [body, scuff];
+    });
+  }
+
+  /**
+   * A zombie **idle groan** (t12b): a guttural, wavering moan — two detuned
+   * sawtooth voices whose pitch sags then lifts, shaped by a slow "vocal tract"
+   * band-pass that opens and closes. Deliberately low + soft so a horde of them,
+   * throttled by the caller's scheduler, murmurs rather than clips. Positional.
+   */
+  zombieGroan(pos: Point3): void {
+    if (this.playBuffer('zombie_groan', pos, { rate: 0.92 + Math.random() * 0.16 })) return;
+    this.oneShot(pos, (ctx, t0, dest) => {
+      const dur = 0.7 + Math.random() * 0.5;
+      const base = 70 + Math.random() * 30; // a low guttural fundamental
+      // A fundamental that sags away then partly recovers — a moan.
+      const voice = ctx.createOscillator();
+      voice.type = 'sawtooth';
+      voice.frequency.setValueAtTime(base, t0);
+      voice.frequency.linearRampToValueAtTime(base * 0.82, t0 + dur * 0.5);
+      voice.frequency.linearRampToValueAtTime(base * 0.92, t0 + dur);
+      // A slightly detuned twin for a rough, inhuman beat.
+      const voice2 = ctx.createOscillator();
+      voice2.type = 'sawtooth';
+      voice2.frequency.setValueAtTime(base * 1.01, t0);
+      voice2.frequency.linearRampToValueAtTime(base * 0.83, t0 + dur * 0.5);
+      // A vocal-tract-ish band-pass "formant" that opens then closes.
+      const formant = ctx.createBiquadFilter();
+      formant.type = 'bandpass';
+      formant.Q.value = 3.5;
+      formant.frequency.setValueAtTime(320, t0);
+      formant.frequency.linearRampToValueAtTime(560, t0 + dur * 0.6);
+      formant.frequency.linearRampToValueAtTime(280, t0 + dur);
+      const env = this.env(ctx, t0, 0.12, dur, 0.3);
+      voice.connect(formant);
+      voice2.connect(formant);
+      formant.connect(env).connect(dest);
+      const stop = t0 + 0.12 + dur + 0.05;
+      voice.start(t0);
+      voice.stop(stop);
+      voice2.start(t0);
+      voice2.stop(stop);
+      return [voice, voice2];
+    });
+  }
+
+  /**
+   * A zombie **aggro snarl** (t12b): brighter + shorter than the groan — a
+   * sawtooth growl that spikes up then tears down through a sweeping band-pass,
+   * with a ragged noise rasp for the wet edge. The louder, angrier voice; still
+   * kept to a modest peak. Positional.
+   */
+  zombieSnarl(pos: Point3): void {
+    if (this.playBuffer('zombie_snarl', pos, { rate: 0.94 + Math.random() * 0.12 })) return;
+    this.oneShot(pos, (ctx, t0, dest) => {
+      const dur = 0.42 + Math.random() * 0.2;
+      const base = 130 + Math.random() * 50;
+      // A snapping growl: pitch spikes up, then tears down.
+      const growl = ctx.createOscillator();
+      growl.type = 'sawtooth';
+      growl.frequency.setValueAtTime(base, t0);
+      growl.frequency.exponentialRampToValueAtTime(base * 1.5, t0 + 0.05);
+      growl.frequency.exponentialRampToValueAtTime(base * 0.6, t0 + dur);
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.Q.value = 2.2;
+      bp.frequency.setValueAtTime(700, t0);
+      bp.frequency.exponentialRampToValueAtTime(1500, t0 + 0.08);
+      bp.frequency.exponentialRampToValueAtTime(500, t0 + dur);
+      const growlEnv = this.env(ctx, t0, 0.01, dur, 0.4);
+      growl.connect(bp).connect(growlEnv).connect(dest);
+      growl.start(t0);
+      growl.stop(t0 + dur + 0.05);
+
+      // A band of noise for the ragged, wet edge of the snarl.
+      const rasp = ctx.createBufferSource();
+      rasp.buffer = this.noiseBuffer;
+      const rbp = ctx.createBiquadFilter();
+      rbp.type = 'bandpass';
+      rbp.Q.value = 1.0;
+      rbp.frequency.setValueAtTime(900, t0);
+      rbp.frequency.exponentialRampToValueAtTime(2200, t0 + 0.1);
+      const raspEnv = this.env(ctx, t0, 0.008, dur * 0.8, 0.2);
+      rasp.connect(rbp).connect(raspEnv).connect(dest);
+      rasp.start(t0, Math.random() * 0.5);
+      rasp.stop(t0 + dur);
+      return [growl, rasp];
+    });
+  }
+
+  /**
+   * A zombie **claw swipe** (t12b): a fast, high band of noise raking upward
+   * then falling — sharper and quicker than the bat {@link swing}. Used for a
+   * zombie's `'attack'` (versus the human bat whoosh). Positioned at the attacker.
+   */
+  zombieClaw(pos: Point3): void {
+    if (this.playBuffer('zombie_claw', pos, { rate: 0.95 + Math.random() * 0.1 })) return;
+    this.oneShot(pos, (ctx, t0, dest) => {
+      const swipe = ctx.createBufferSource();
+      swipe.buffer = this.noiseBuffer;
+      swipe.playbackRate.value = 1.3;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.Q.value = 1.6;
+      bp.frequency.setValueAtTime(1800, t0);
+      bp.frequency.exponentialRampToValueAtTime(3600, t0 + 0.06);
+      bp.frequency.exponentialRampToValueAtTime(1200, t0 + 0.14);
+      const env = this.env(ctx, t0, 0.006, 0.14, 0.34);
+      swipe.connect(bp).connect(env).connect(dest);
+      swipe.start(t0, Math.random() * 0.5);
+      swipe.stop(t0 + 0.16);
+      return [swipe];
+    });
+  }
+
+  /**
+   * A **round-start horn** (t12b): a two-note rising fanfare (root → a fifth
+   * above), each note two detuned sawtooths fattened together and softened by a
+   * low-pass — a brass swell. Non-positional in practice (emitted at the
+   * listener so it reads centred). Driven off the `'roundStart'` event.
+   */
+  roundStart(pos: Point3): void {
+    if (this.playBuffer('round_start', pos)) return;
+    this.oneShot(pos, (ctx, t0, dest) => {
+      const lp = ctx.createBiquadFilter();
+      lp.type = 'lowpass';
+      lp.frequency.value = 1600;
+      lp.Q.value = 0.7;
+      lp.connect(dest);
+      // G3 then a fifth up to D4, the second held — a rising call.
+      const notes = [
+        { f: 196, at: 0.0, dur: 0.34 },
+        { f: 294, at: 0.28, dur: 0.5 },
+      ];
+      const oscs: AudioScheduledSourceNode[] = [];
+      for (const n of notes) {
+        const osc = ctx.createOscillator();
+        osc.type = 'sawtooth';
+        osc.frequency.value = n.f;
+        const osc2 = ctx.createOscillator();
+        osc2.type = 'sawtooth';
+        osc2.frequency.value = n.f * 1.006; // slight detune → a fatter horn
+        const env = this.env(ctx, t0 + n.at, 0.03, n.dur, 0.5);
+        osc.connect(env);
+        osc2.connect(env);
+        env.connect(lp);
+        osc.start(t0 + n.at);
+        osc.stop(t0 + n.at + n.dur + 0.05);
+        osc2.start(t0 + n.at);
+        osc2.stop(t0 + n.at + n.dur + 0.05);
+        oscs.push(osc, osc2);
+      }
+      return oscs;
+    });
+  }
+
+  /**
+   * A **round-end sting** (t12b), varied by `winner`: a human win is a bright
+   * triangle major triad that lifts and resolves; a zombie win (or unknown) is a
+   * darker sawtooth minor cluster, low-passed, that sags and sinks. Non-positional
+   * in practice (emitted at the listener). Driven off the `'roundEnd'` event.
+   */
+  roundEnd(pos: Point3, winner?: 'human' | 'zombie'): void {
+    const name =
+      winner === 'zombie' ? 'round_end_zombie' : winner === 'human' ? 'round_end_human' : 'round_end';
+    if (this.playBuffer(name, pos)) return;
+    const humanWin = winner === 'human';
+    this.oneShot(pos, (ctx, t0, dest) => {
+      const lp = ctx.createBiquadFilter();
+      lp.type = 'lowpass';
+      lp.frequency.value = humanWin ? 1800 : 900;
+      lp.connect(dest);
+      // Human: a C major triad that lifts. Otherwise: a low minor cluster that sinks.
+      const roots = humanWin ? [262, 330, 392] : [220, 233, 175];
+      const oscs: AudioScheduledSourceNode[] = [];
+      for (let i = 0; i < roots.length; i += 1) {
+        const f = roots[i];
+        const osc = ctx.createOscillator();
+        osc.type = humanWin ? 'triangle' : 'sawtooth';
+        osc.frequency.setValueAtTime(f, t0);
+        osc.frequency.exponentialRampToValueAtTime(humanWin ? f * 1.06 : f * 0.85, t0 + 0.9);
+        const env = this.env(ctx, t0 + i * 0.04, 0.04, 0.95, 0.34);
+        osc.connect(env).connect(lp);
+        osc.start(t0 + i * 0.04);
+        osc.stop(t0 + 1.0);
+        oscs.push(osc);
+      }
+      return oscs;
+    });
+  }
+
+  /**
+   * A **lobby-ready blip** (t12b): a clean two-step square-wave chirp (low →
+   * high), a friendly UI confirm when a player readies up. Non-positional in
+   * practice (emitted at the listener / origin so it reads centred).
+   */
+  lobbyReady(pos: Point3): void {
+    if (this.playBuffer('lobby_ready', pos)) return;
+    this.oneShot(pos, (ctx, t0, dest) => {
+      const steps = [
+        { f: 660, at: 0.0 },
+        { f: 990, at: 0.09 },
+      ];
+      const oscs: AudioScheduledSourceNode[] = [];
+      for (const st of steps) {
+        const osc = ctx.createOscillator();
+        osc.type = 'square';
+        osc.frequency.value = st.f;
+        const env = this.env(ctx, t0 + st.at, 0.005, 0.08, 0.22);
+        osc.connect(env).connect(dest);
+        osc.start(t0 + st.at);
+        osc.stop(t0 + st.at + 0.1);
+        oscs.push(osc);
+      }
+      return oscs;
     });
   }
 
