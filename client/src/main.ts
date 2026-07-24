@@ -38,9 +38,11 @@ import {
   MAP_SIZE,
   TICK_MS,
   CLIENT_FPS,
+  ROUND_LENGTH_MS,
   generateWorld,
   type World,
   type EntityKind,
+  type RoundMessage,
 } from '@crawling-dark/shared';
 import { Connection } from './net/Connection';
 import { Predictor } from './predict/Predictor';
@@ -58,7 +60,7 @@ import {
 } from './scene/Atmosphere';
 import { createSky } from './scene/Sky';
 import { HUD } from './ui/HUD';
-import { AudioEngine } from './audio/AudioEngine';
+import { AudioEngine, type Point3, type FootstepSurface } from './audio/AudioEngine';
 import { AudioControls } from './ui/AudioControls';
 import type { InterpolatedEntity } from './net/Interpolation';
 
@@ -174,6 +176,27 @@ connection.connect();
  */
 const audio = new AudioEngine();
 
+/**
+ * Register the t12b one-shot sample names (optional, offline-safe). No binary
+ * files ship for these, so every fetch 404s and the {@link AudioEngine} synth
+ * voice plays instead — this merely lets real recordings be dropped into
+ * `client/public/audio/sfx/` later with zero code changes (the loader swallows
+ * misses; see {@link AudioEngine.loadSamples}).
+ */
+audio.loadSamples({
+  jump: 'audio/sfx/jump.wav',
+  land: 'audio/sfx/land.wav',
+  zombie_groan: 'audio/sfx/zombie_groan.wav',
+  zombie_snarl: 'audio/sfx/zombie_snarl.wav',
+  zombie_claw: 'audio/sfx/zombie_claw.wav',
+  round_start: 'audio/sfx/round_start.wav',
+  round_end_human: 'audio/sfx/round_end_human.wav',
+  round_end_zombie: 'audio/sfx/round_end_zombie.wav',
+  lobby_ready: 'audio/sfx/lobby_ready.wav',
+  footstep_dirt: 'audio/sfx/footstep_dirt.wav',
+  footstep_wet: 'audio/sfx/footstep_wet.wav',
+});
+
 /** Bottom-right mute/volume panel; also binds `M` to toggle mute. */
 const audioControls = new AudioControls(app, audio);
 
@@ -206,6 +229,7 @@ renderer.domElement.addEventListener('mousedown', (ev) => {
   // AudioContext resumes and the ambient bed starts the moment play begins.
   audio.resume();
   audio.startAmbient();
+  audio.startMusic();
   if (ev.button !== 0) return;
   if (!controls.pointerLocked) return;
   connection.sendAttack();
@@ -236,8 +260,13 @@ window.addEventListener('keydown', (ev) => {
   // so a keyboard-only player who never clicks the canvas still gets sound.
   audio.resume();
   audio.startAmbient();
+  audio.startMusic();
   localReady = !localReady;
   connection.sendReady(localReady);
+  // A friendly confirm blip when you ready up (t12b). Emitted at the origin so
+  // it reads centred: in the lobby the listener sits on the spawn plaza, and
+  // when there is no local body yet the listener defaults to the origin too.
+  if (localReady) audio.lobbyReady({ x: 0, y: 0, z: 0 });
 });
 
 /** Last round phase we observed, to detect the transition back into `lobby`. */
@@ -731,11 +760,63 @@ const FOOTSTEP_INTERVAL_MS: Readonly<Record<'walk' | 'run' | 'crawl', number>> =
 const footstepTimers = new Map<number, number>();
 
 /**
+ * Last movement/action state seen per entity (t12b), so {@link driveFootsteps}
+ * can detect the return-to-ground edge (leaving the `'jump'` state) and fire a
+ * land thud. Pruned alongside the footstep timers.
+ */
+const prevEntityState = new Map<number, InterpolatedEntity['state']>();
+
+/**
+ * Chebyshev distance (m) at/beyond which the ground reads as the perimeter
+ * forest band rather than town paving — matches shared's `FOREST_BAND_INNER`
+ * (`TOWN_HALF + 4 ≈ 58`), the inner edge of the tree wall. Steps out here play
+ * as soft `'dirt'`; see {@link surfaceForStep}.
+ */
+const FOREST_SURFACE_EDGE = 58;
+
+/** How close to the shoreline (m) a step counts as `'wet'` — roughly one stride. */
+const WATER_SURFACE_MARGIN = 2.5;
+
+/**
+ * Pick the footstep surface for a world position from {@link world} data (t12b):
+ * within a stride of the lake edge → `'wet'`; out in the perimeter forest band →
+ * `'dirt'`; otherwise the town's hard `'stone'` paving. Cheap: a couple of
+ * comparisons and, when a lake exists, one distance check.
+ */
+function surfaceForStep(x: number, z: number): FootstepSurface {
+  if (world !== null) {
+    const lake = world.water;
+    if (lake !== null) {
+      const dx = x - lake.cx;
+      const dz = z - lake.cz;
+      if (Math.hypot(dx, dz) <= lake.radius + WATER_SURFACE_MARGIN) return 'wet';
+    }
+    if (Math.max(Math.abs(x), Math.abs(z)) >= FOREST_SURFACE_EDGE) return 'dirt';
+  }
+  return 'stone';
+}
+
+/**
+ * The world position at which to play a **non-positional** cue (round horn / end
+ * sting / lobby blip) so it lands centred on the player: the local entity's own
+ * position when we have one, else the world origin. Routed through the same
+ * positional {@link AudioEngine.oneShot} spine, it reads as pan ≈ 0, gain ≈ 1.
+ */
+function listenerAnchor(entities: Map<number, InterpolatedEntity>): Point3 {
+  const me = connection.playerId !== null ? entities.get(connection.playerId) : undefined;
+  return me ?? { x: 0, y: 0, z: 0 };
+}
+
+/**
  * Emit positional footsteps for every entity in a movement state, including the
  * local player (also drawn from server state until prediction lands). Each
  * entity accrues frame time and fires a step when it crosses its speed-dependent
  * interval; the {@link AudioEngine} culls anything out of earshot, so distant
- * hordes cost only the cheap bookkeeping here.
+ * hordes cost only the cheap bookkeeping here. Steps are surface-flavoured by
+ * {@link surfaceForStep}. Also drives both the take-off whoosh and the land thud
+ * off the `'jump'` state edges: the server never emits a `'jump'` *event* (only
+ * attack/stun/infect/roundStart/roundEnd), so `'jump'` is observed purely as a
+ * snapshot movement state, and both cues ride its enter/leave transitions here.
  */
 function driveFootsteps(
   entities: Map<number, InterpolatedEntity>,
@@ -743,6 +824,16 @@ function driveFootsteps(
 ): void {
   for (const entity of entities.values()) {
     const s = entity.state;
+
+    // Jump cues off the 'jump' state edges (there is no server 'jump' event):
+    // entering 'jump' is a take-off whoosh, leaving it is a touch-down thud —
+    // positional, for everyone, local + remote. The `prev !== undefined` guard
+    // skips a spurious whoosh for an entity first sighted already mid-jump.
+    const prev = prevEntityState.get(entity.id);
+    if (prev !== undefined && prev !== 'jump' && s === 'jump') audio.jump(entity);
+    else if (prev === 'jump' && s !== 'jump') audio.land(entity);
+    prevEntityState.set(entity.id, s);
+
     if (s !== 'walk' && s !== 'run' && s !== 'crawl') {
       footstepTimers.delete(entity.id);
       continue;
@@ -753,14 +844,85 @@ function driveFootsteps(
     let t = footstepTimers.get(entity.id) ?? (entity.id * 137) % interval;
     t += dtMs;
     if (t >= interval) {
-      audio.footstep(entity, s);
+      audio.footstep(entity, s, surfaceForStep(entity.x, entity.z));
       t -= interval;
     }
     footstepTimers.set(entity.id, t);
   }
-  // Drop timers for entities that have left the world entirely.
+  // Drop timers + state for entities that have left the world entirely.
   for (const id of footstepTimers.keys()) {
     if (!entities.has(id)) footstepTimers.delete(id);
+  }
+  for (const id of prevEntityState.keys()) {
+    if (!entities.has(id)) prevEntityState.delete(id);
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Zombie vocalisation scheduler — occasional groans/snarls, throttled          */
+/* -------------------------------------------------------------------------- */
+
+/** Minimum gap (ms) between ANY two zombie vocalisations — a global throttle so a horde never clips. */
+const ZOMBIE_VOICE_MIN_GAP_MS = 260;
+/** A zombie's vocalisation cadence window (ms): the next attempt is scheduled this far out. */
+const ZOMBIE_VOICE_MIN_MS = 3800;
+const ZOMBIE_VOICE_MAX_MS = 9000;
+/** Zombies beyond this (m) from the listener stay silent, so a distant horde never spends the global slot. */
+const ZOMBIE_VOICE_RANGE_M = 40;
+/** Chance a due vocalisation is the aggressive snarl rather than the low idle groan. */
+const ZOMBIE_SNARL_CHANCE = 0.28;
+
+/** Per-zombie countdown (ms) to its next vocalisation attempt; id-phased on first sighting. */
+const zombieVoiceTimers = new Map<number, number>();
+/** Global cooldown (ms) shared across the whole horde; caps how often ANY zombie speaks. */
+let zombieVoiceCooldownMs = 0;
+
+/**
+ * Sparse, throttled zombie chatter (t12b): each zombie counts down an id-phased
+ * timer and, when due AND within earshot AND the shared cooldown has elapsed,
+ * emits a low groan (usually) or an aggro snarl (occasionally) at its own
+ * position, then reschedules a few seconds out. The global {@link
+ * zombieVoiceCooldownMs} plus the distance gate keep a busy horde from spamming
+ * or clipping — at most one voice per {@link ZOMBIE_VOICE_MIN_GAP_MS}. Out-of-
+ * earshot or cooldown-blocked zombies simply requeue soon and stay silent.
+ */
+function driveZombieVoices(
+  entities: Map<number, InterpolatedEntity>,
+  dtMs: number,
+  listener: Point3,
+): void {
+  zombieVoiceCooldownMs -= dtMs;
+  for (const entity of entities.values()) {
+    if (entity.kind !== 'zombie') {
+      zombieVoiceTimers.delete(entity.id);
+      continue;
+    }
+    // First sighting: id-derived phase so a spawned horde doesn't all groan at once.
+    let t =
+      zombieVoiceTimers.get(entity.id) ??
+      ZOMBIE_VOICE_MIN_MS + ((entity.id * 911) % (ZOMBIE_VOICE_MAX_MS - ZOMBIE_VOICE_MIN_MS));
+    t -= dtMs;
+    if (t <= 0) {
+      const dx = entity.x - listener.x;
+      const dz = entity.z - listener.z;
+      if (dx * dx + dz * dz > ZOMBIE_VOICE_RANGE_M * ZOMBIE_VOICE_RANGE_M) {
+        // Out of earshot: stay quiet, don't spend the global slot, check back soon.
+        t = 900 + Math.random() * 1400;
+      } else if (zombieVoiceCooldownMs > 0) {
+        // Horde already speaking this window: retry shortly rather than overlap.
+        t = 120 + Math.random() * 200;
+      } else {
+        if (Math.random() < ZOMBIE_SNARL_CHANCE) audio.zombieSnarl(entity);
+        else audio.zombieGroan(entity);
+        zombieVoiceCooldownMs = ZOMBIE_VOICE_MIN_GAP_MS;
+        t = ZOMBIE_VOICE_MIN_MS + Math.random() * (ZOMBIE_VOICE_MAX_MS - ZOMBIE_VOICE_MIN_MS);
+      }
+    }
+    zombieVoiceTimers.set(entity.id, t);
+  }
+  // Drop schedules for zombies that have left the world entirely.
+  for (const id of zombieVoiceTimers.keys()) {
+    if (!entities.has(id)) zombieVoiceTimers.delete(id);
   }
 }
 
@@ -802,6 +964,50 @@ let inputAccumulatorMs = 0;
  * each send and reset to the currently-held keys so held keys persist.
  */
 let accumulatedKeys = 0;
+
+/* -------------------------------------------------------------------------- */
+/* Music intensity (M12 · t12c)                                               */
+/* -------------------------------------------------------------------------- */
+
+/** Clamp `x` into the inclusive range [0, 1]. */
+function clamp01(x: number): number {
+  return x < 0 ? 0 : x > 1 ? 1 : x;
+}
+
+/**
+ * Map the current {@link RoundMessage} to a musical intensity in [0, 1] for the
+ * {@link AudioEngine.setMusicIntensity dynamic music bed}:
+ *
+ *  - no round / `lobby` → calm (0),
+ *  - `countdown` → a faint pre-match unease (0.15),
+ *  - `active` → the greater of two pressures, so either can drive the dread:
+ *      • *attrition* — how far the humans have been overrun
+ *        (`1 - humansAlive / (humansAlive + zombieCount)`), and
+ *      • *the clock* — how much of the round has elapsed,
+ *    lifted onto a 0.25 floor so play always feels tenser than the lobby,
+ *  - `ended` → a held spike (0.95).
+ *
+ * The engine smooths every change internally, so this can be recomputed and
+ * pushed each frame without any risk of a click.
+ */
+function roundMusicIntensity(round: RoundMessage | null): number {
+  if (round === null) return 0;
+  switch (round.phase) {
+    case 'countdown':
+      return 0.15;
+    case 'active': {
+      const total = round.humansAlive + round.zombieCount;
+      const attrition = total > 0 ? 1 - round.humansAlive / total : 0;
+      const elapsed = 1 - clamp01(round.timeLeftMs / ROUND_LENGTH_MS);
+      return clamp01(0.25 + 0.75 * Math.max(attrition, elapsed));
+    }
+    case 'ended':
+      return 0.95;
+    case 'lobby':
+    default:
+      return 0;
+  }
+}
 
 /* -------------------------------------------------------------------------- */
 /* Render loop                                                                */
@@ -894,7 +1100,9 @@ function animate(): void {
         const y = ev.y ?? src?.y ?? 0;
         const z = ev.z ?? src?.z ?? 0;
         spawnSwingVfx(x, y, z, src?.yaw ?? 0);
-        audio.swing({ x, y, z }); // bat swing whoosh at the swinger
+        // A zombie's attack is a claw swipe; a human's is the bat whoosh (t12b).
+        if (src?.kind === 'zombie') audio.zombieClaw({ x, y, z });
+        else audio.swing({ x, y, z });
         break;
       }
       case 'stun': {
@@ -914,11 +1122,24 @@ function animate(): void {
         const z = ev.z ?? tgt?.z ?? 0;
         spawnInfectVfx(x, y, z);
         audio.infect({ x, y, z }); // infection stinger at the victim
+        audio.duck(); // dip music/ambient so the stinger reads (t12e)
         pushFeedLine(`Player #${ev.targetId ?? '?'} was turned 🧟`);
         break;
       }
+      case 'roundStart': {
+        // A rising horn to open the match. Non-positional: centred on the player.
+        audio.roundStart(listenerAnchor(entities));
+        audio.duck(); // dip the beds so the opening horn reads (t12e)
+        break;
+      }
+      case 'roundEnd': {
+        // A closing sting, varied by who won (bright human triad vs dark zombie
+        // cluster). Winner rides on the ROUND message, not the event itself.
+        audio.roundEnd(listenerAnchor(entities), connection.round?.winner);
+        audio.duck(0.28); // deeper dip so the closing sting lands (t12e)
+        break;
+      }
       default:
-        // jump / roundStart / roundEnd — no client VFX for these yet.
         break;
     }
   }
@@ -932,6 +1153,22 @@ function animate(): void {
   if (localFeet !== null) {
     audio.setListener(localFeet, controls.yaw);
     driveFootsteps(entities, dtMs);
+    driveZombieVoices(entities, dtMs, localFeet);
+  }
+
+  // 5c. Music: drive the dynamic-intensity bed off the round state (M12 · t12c).
+  //     Calm in the lobby/countdown; during play, tenser as the humans dwindle
+  //     and the clock winds down; a held spike at the end. The engine smooths
+  //     every change internally, so pushing a fresh target each frame is fine.
+  audio.setMusicIntensity(roundMusicIntensity(connection.round));
+
+  // 5d. Audio: environment atmosphere (M12 · t12d). Occasional, subtle,
+  //     positional one-shots — distant howls/wind, forest creaks/leaves, and
+  //     water lapping at the lake — chosen from the seeded world features and
+  //     biased to the listener's earshot. Gated on a local body (so the
+  //     listener is anchored) and the town existing (so features are known).
+  if (localFeet !== null && world !== null) {
+    audio.updateEnvironment(dtMs, world);
   }
 
   // 6. Advance transient combat VFX and the turn feed, culling the expired.
