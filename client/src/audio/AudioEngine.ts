@@ -70,9 +70,47 @@ const MAX_AUDIBLE = 42;
 /** Default bus volumes (0..1); overridable via the setters + on-screen controls. */
 const DEFAULT_MASTER = 0.8;
 const DEFAULT_SFX = 0.9;
+const DEFAULT_MUSIC = 0.55;
 
 /** Fixed level of the looping ambient bed, relative to the master bus. */
 const AMBIENT_LEVEL = 0.6;
+
+/* -- Music bed (M12 · t12c): a synth pad/pulse layer with dynamic intensity -- */
+
+/** Calm-layer gain of the minor-pad chord at intensity 0 (before the tense duck). */
+const MUSIC_CALM_LEVEL = 0.5;
+
+/** Max gain the dissonant "tense" chord layer reaches at intensity 1. */
+const MUSIC_TENSE_LEVEL = 0.55;
+
+/** Max depth of the tremolo pulse (heartbeat) layer at intensity 1. */
+const MUSIC_PULSE_LEVEL = 0.28;
+
+/** Shared voicing low-pass cutoff (Hz) at intensity 0 (dark) → 1 (bright/urgent). */
+const MUSIC_CUTOFF_CALM = 480;
+const MUSIC_CUTOFF_TENSE = 3200;
+
+/** Tremolo pulse rate (Hz) at intensity 0 → 1 (a quickening heartbeat). */
+const MUSIC_PULSE_HZ_CALM = 1.1;
+const MUSIC_PULSE_HZ_TENSE = 2.8;
+
+/** Smoothing time-constant (s) for intensity ramps — long enough to never jerk. */
+const MUSIC_INTENSITY_TAU = 0.8;
+
+/** Detuned minor-pad chord (Hz): the always-present calm bed (A minor, low). */
+const MUSIC_CALM_CHORD: readonly number[] = [110.0, 130.81, 164.81, 220.0];
+
+/** Dissonant/higher chord (Hz) gated in by intensity: tritone + cluster + urgency. */
+const MUSIC_TENSE_CHORD: readonly number[] = [155.56, 233.08, 329.63];
+
+/** Root (Hz) of the low tremolo pulse tone (the heartbeat). */
+const MUSIC_PULSE_ROOT = 110.0;
+
+/** Logical name of an OPTIONAL real music track (registered via loadSamples). */
+const MUSIC_TRACK = 'music';
+
+/** Level of the optional real track, when a deployment registers + loads one. */
+const MUSIC_TRACK_LEVEL = 0.8;
 
 /** Per-speed footstep character: playback rate, low-pass cutoff, level, duration. */
 const FOOTSTEP: Readonly<Record<FootstepKind, {
@@ -137,17 +175,41 @@ export class AudioEngine {
   private sfxGain: GainNode | null = null;
   /** Ambient sub-bus (the looping bed routes here), held at {@link AMBIENT_LEVEL}. */
   private ambientGain: GainNode | null = null;
+  /** Music sub-bus (the dynamic-intensity bed routes here), scaled by {@link musicVolume}. */
+  private musicGain: GainNode | null = null;
 
   /** Cached white-noise buffer reused by every filtered-noise voice. */
   private noiseBuffer: AudioBuffer | null = null;
 
   /** Guards {@link startAmbient} so the bed is only ever built once. */
   private ambientStarted = false;
+  /** Guards {@link startMusic} so the music bed is only ever built once. */
+  private musicStarted = false;
+
+  /* Music-bed nodes captured at {@link startMusic} so {@link setMusicIntensity} can
+   * crossfade its layers live. All null until the bed is built (then again after
+   * {@link dispose}). */
+  /** Internal fade-in gain for the whole music bed (kept apart from the user volume). */
+  private musicBedGain: GainNode | null = null;
+  /** Shared voicing low-pass whose cutoff brightens with intensity. */
+  private musicFilter: BiquadFilterNode | null = null;
+  /** Calm minor-pad layer gain (ducks slightly as the tense layer rises). */
+  private musicCalmGain: GainNode | null = null;
+  /** Dissonant/high "tense" layer gain, gated in by intensity. */
+  private musicTenseGain: GainNode | null = null;
+  /** Tremolo pulse (heartbeat) depth gain, brought up by intensity. */
+  private musicPulseGain: GainNode | null = null;
+  /** Tremolo pulse LFO whose rate quickens with intensity. */
+  private musicPulseLfo: OscillatorNode | null = null;
+  /** Latest intensity in [0, 1]; re-applied whenever the bed (re)starts. */
+  private musicIntensity = 0;
 
   /** Live master volume in [0, 1] (applied through the mute multiplier). */
   private master = DEFAULT_MASTER;
   /** Live SFX volume in [0, 1]. */
   private sfx = DEFAULT_SFX;
+  /** Live music-bed volume in [0, 1]. */
+  private music = DEFAULT_MUSIC;
   /** Whether all output is muted (master forced to silence). */
   private isMuted = false;
 
@@ -192,10 +254,14 @@ export class AudioEngine {
     const ambient = ctx.createGain();
     ambient.connect(master);
 
+    const music = ctx.createGain();
+    music.connect(master);
+
     this.ctx = ctx;
     this.masterGain = master;
     this.sfxGain = sfx;
     this.ambientGain = ambient;
+    this.musicGain = music;
     this.noiseBuffer = this.makeNoise(ctx, 1.5);
 
     // Kick off sample loading (t12a). Async + fire-and-forget: one-shots synth-
@@ -216,6 +282,15 @@ export class AudioEngine {
     this.sfxGain = null;
     this.ambientGain = null;
     this.ambientStarted = false;
+    // Music bed (M12 · t12c): drop the bus + the captured intensity nodes.
+    this.musicGain = null;
+    this.musicStarted = false;
+    this.musicBedGain = null;
+    this.musicFilter = null;
+    this.musicCalmGain = null;
+    this.musicTenseGain = null;
+    this.musicPulseGain = null;
+    this.musicPulseLfo = null;
   }
 
   /* ---- Volume + mute ---------------------------------------------------- */
@@ -272,6 +347,8 @@ export class AudioEngine {
     // essentially on target within `ramp` seconds without an audible step.
     this.masterGain?.gain.setTargetAtTime(masterTarget, now, Math.max(ramp / 3, 0.001));
     this.sfxGain?.gain.setTargetAtTime(this.sfx, now, Math.max(ramp / 3, 0.001));
+    // Music bus carries the user's music volume; its fade-in lives on musicBedGain.
+    this.musicGain?.gain.setTargetAtTime(this.music, now, Math.max(ramp / 3, 0.001));
     if (!this.ambientStarted) {
       // Hold the bed muted until it actually starts, then it fades in itself.
       this.ambientGain?.gain.setValueAtTime(0, now);
@@ -359,6 +436,203 @@ export class AudioEngine {
     for (const node of [wind, droneA, droneB, lfoCut, lfoLvl]) {
       node.start(t0);
     }
+  }
+
+  /* ---- Music bed (dynamic intensity, M12 · t12c) ------------------------ */
+
+  /** Current music-bed volume in [0, 1]. */
+  get musicVolume(): number {
+    return this.music;
+  }
+
+  /** Set the music-bed volume (clamped to [0, 1]); takes effect immediately. */
+  setMusicVolume(v: number): void {
+    this.music = clamp(v, 0, 1);
+    this.applyGains();
+  }
+
+  /**
+   * Start the looping **music bed** once the context is running — a thing apart
+   * from the wind/drone {@link startAmbient ambient texture}. It is a wholly
+   * synthesized, evolving score, built to be reshaped live by
+   * {@link setMusicIntensity} and layered so calm and tension crossfade without a
+   * seam:
+   *
+   *  - a **calm** detuned minor pad ({@link MUSIC_CALM_CHORD}) that always plays,
+   *  - a **tense** dissonant/high chord ({@link MUSIC_TENSE_CHORD}: a tritone +
+   *    cluster + an urgent upper voice) gated in as intensity rises,
+   *  - a soft **tremolo pulse** (a heartbeat) whose depth + rate climb with dread,
+   *  - a shared low-pass that darkens when calm and brightens when tense.
+   *
+   * The whole bed swells in over ~3 s via an internal {@link musicBedGain} (the
+   * {@link musicGain} bus itself carries the user's music volume), so it never
+   * pops on. Built exactly once; safe to call on every gesture.
+   *
+   * Offline-safe/synth-first: no asset files are required. If a deployment has
+   * registered a real track (`loadSamples({ music: '…' })`) and it has loaded, it
+   * is looped through the same non-positional bed as an extra layer.
+   */
+  startMusic(): void {
+    const ctx = this.ctx;
+    if (ctx === null || this.musicGain === null || this.musicStarted) return;
+    this.musicStarted = true;
+    const t0 = ctx.currentTime;
+
+    // Internal fade-in gain: swell the whole bed up over ~3 s. Kept separate from
+    // the musicGain bus so the user's volume slider stays independent of the swell.
+    const bed = ctx.createGain();
+    bed.gain.setValueAtTime(0, t0);
+    bed.gain.linearRampToValueAtTime(1, t0 + 3);
+    bed.connect(this.musicGain);
+    this.musicBedGain = bed;
+
+    // Shared voicing low-pass: dark when calm, opened up by intensity.
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = MUSIC_CUTOFF_CALM;
+    filter.Q.value = 0.8;
+    filter.connect(bed);
+    this.musicFilter = filter;
+
+    // The two chord layers feed the shared filter.
+    const calm = ctx.createGain();
+    calm.gain.value = MUSIC_CALM_LEVEL;
+    calm.connect(filter);
+    this.musicCalmGain = calm;
+
+    const tense = ctx.createGain();
+    tense.gain.value = 0; // silent at intensity 0; setMusicIntensity gates it in.
+    tense.connect(filter);
+    this.musicTenseGain = tense;
+
+    // Oscillators are started together at t0 so their beats stay phase-coherent.
+    const started: OscillatorNode[] = [];
+
+    /**
+     * Spin up one detuned sustained voice (osc → fixed gain → `dest`) and queue
+     * it for a synchronized start. Local to this method so it never touches the
+     * shared one-shot synthesis helpers.
+     */
+    const voice = (
+      freq: number,
+      detune: number,
+      type: OscillatorType,
+      level: number,
+      dest: AudioNode,
+    ): void => {
+      const osc = ctx.createOscillator();
+      osc.type = type;
+      osc.frequency.value = freq;
+      osc.detune.value = detune;
+      const g = ctx.createGain();
+      g.gain.value = level;
+      osc.connect(g).connect(dest);
+      started.push(osc);
+    };
+
+    // Calm minor pad — each chord tone as a ±6-cent detuned pair for width.
+    for (const f of MUSIC_CALM_CHORD) {
+      voice(f, -6, 'sawtooth', 0.11, calm);
+      voice(f, 6, 'sawtooth', 0.11, calm);
+    }
+    // Tense dissonant/high voices — wider detune for a colder, uneasier beat.
+    for (const f of MUSIC_TENSE_CHORD) {
+      voice(f, -9, 'sawtooth', 0.1, tense);
+      voice(f, 9, 'sawtooth', 0.1, tense);
+    }
+
+    // Heartbeat pulse: a low triangle tone, tremolo'd by an LFO, whose overall
+    // depth (musicPulseGain) is brought up by intensity.
+    const pulseTone = ctx.createOscillator();
+    pulseTone.type = 'triangle';
+    pulseTone.frequency.value = MUSIC_PULSE_ROOT;
+    const pulseTrem = ctx.createGain();
+    pulseTrem.gain.value = 0.5; // center of the tremolo swing (rides 0..1 with the LFO)
+    const pulseDepth = ctx.createGain();
+    pulseDepth.gain.value = 0; // intensity-controlled; silent when calm.
+    pulseTone.connect(pulseTrem).connect(pulseDepth).connect(filter);
+    this.musicPulseGain = pulseDepth;
+
+    const pulseLfo = ctx.createOscillator();
+    pulseLfo.type = 'sine';
+    pulseLfo.frequency.value = MUSIC_PULSE_HZ_CALM;
+    const pulseLfoDepth = ctx.createGain();
+    pulseLfoDepth.gain.value = 0.5; // ± swing → pulseTrem gain rides 0..1
+    pulseLfo.connect(pulseLfoDepth).connect(pulseTrem.gain);
+    this.musicPulseLfo = pulseLfo;
+    started.push(pulseTone, pulseLfo);
+
+    // Slow breathing on the shared cutoff so the calm bed never sits still. This
+    // is additive to the intensity-driven base cutoff (setMusicIntensity).
+    const filtLfo = ctx.createOscillator();
+    filtLfo.type = 'sine';
+    filtLfo.frequency.value = 0.05;
+    const filtLfoGain = ctx.createGain();
+    filtLfoGain.gain.value = 80;
+    filtLfo.connect(filtLfoGain).connect(filter.frequency);
+    started.push(filtLfo);
+
+    // Optional real track (synth-first: inert unless a deployment registered one
+    // via loadSamples). Looped through the same non-positional bed → musicGain.
+    const track = this.library.get(MUSIC_TRACK);
+    if (track !== undefined) {
+      const src = ctx.createBufferSource();
+      src.buffer = track;
+      src.loop = true;
+      const g = ctx.createGain();
+      g.gain.value = MUSIC_TRACK_LEVEL;
+      src.connect(g).connect(bed);
+      src.start(t0);
+    }
+
+    for (const osc of started) osc.start(t0);
+
+    // Snap the freshly-built layers to whatever intensity was last requested (0
+    // by default) with a tiny time-constant so there is no click.
+    this.rampMusicIntensity(t0, 0.05);
+  }
+
+  /**
+   * Set the musical **intensity** in [0, 1] and crossfade the bed toward it: the
+   * dissonant tense chord gates in, the calm pad ducks a touch to make room, the
+   * heartbeat pulse deepens + quickens, and the shared low-pass brightens. Every
+   * move is an {@link AudioParam.setTargetAtTime} ramp (~{@link MUSIC_INTENSITY_TAU}s
+   * time-constant), so calling this each frame simply low-pass-follows the target
+   * without a single click. Cheap + safe before {@link startMusic}: the value is
+   * remembered and applied when the bed is built.
+   */
+  setMusicIntensity(x: number): void {
+    this.musicIntensity = clamp(x, 0, 1);
+    const ctx = this.ctx;
+    if (ctx === null || !this.musicStarted) return; // stored; applied on startMusic
+    this.rampMusicIntensity(ctx.currentTime, MUSIC_INTENSITY_TAU);
+  }
+
+  /**
+   * Push {@link musicIntensity} onto the live music-bed nodes, each via a
+   * `setTargetAtTime` ramp starting at `when` with time-constant `tau` (seconds).
+   * No-ops on any node that is null (bed not built). Shared by {@link startMusic}
+   * (a near-instant snap) and {@link setMusicIntensity} (a smooth follow).
+   */
+  private rampMusicIntensity(when: number, tau: number): void {
+    const x = this.musicIntensity;
+    const tc = Math.max(tau, 0.001);
+    // Tense layer gates in; the calm pad ducks up to 30% to clear space for it.
+    this.musicTenseGain?.gain.setTargetAtTime(x * MUSIC_TENSE_LEVEL, when, tc);
+    this.musicCalmGain?.gain.setTargetAtTime(MUSIC_CALM_LEVEL * (1 - 0.3 * x), when, tc);
+    // Heartbeat pulse deepens and quickens with dread.
+    this.musicPulseGain?.gain.setTargetAtTime(x * MUSIC_PULSE_LEVEL, when, tc);
+    this.musicPulseLfo?.frequency.setTargetAtTime(
+      MUSIC_PULSE_HZ_CALM + (MUSIC_PULSE_HZ_TENSE - MUSIC_PULSE_HZ_CALM) * x,
+      when,
+      tc,
+    );
+    // Brighten the shared voicing low-pass as tension climbs.
+    this.musicFilter?.frequency.setTargetAtTime(
+      MUSIC_CUTOFF_CALM + (MUSIC_CUTOFF_TENSE - MUSIC_CUTOFF_CALM) * x,
+      when,
+      tc,
+    );
   }
 
   /* ---- Sample playback (real assets, synth fallback) -------------------- */

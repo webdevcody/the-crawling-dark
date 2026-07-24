@@ -2,8 +2,8 @@
  * The Crawling Dark — audio control overlay (M6 · t6d).
  *
  * A tiny, non-intrusive panel pinned to the bottom-right that drives the
- * {@link AudioEngine}: a mute toggle (also bound to the `M` key) plus master and
- * SFX volume sliders. It is styled to match the HUD / turn-feed idioms — dark,
+ * {@link AudioEngine}: a mute toggle (also bound to the `M` key) plus master,
+ * SFX, and music volume sliders. It is styled to match the HUD / turn-feed idioms — dark,
  * translucent, monospace, blurred — but, unlike those click-through overlays, it
  * opts back into pointer events so its controls are actually usable.
  *
@@ -98,6 +98,8 @@ export class AudioControls {
     this.panel.append(
       this.makeSlider('master', engine.masterVolume, (v) => engine.setMasterVolume(v)),
       this.makeSlider('sfx', engine.sfxVolume, (v) => engine.setSfxVolume(v)),
+      // M12 · t12c: the dynamic-intensity music bed gets its own independent fader.
+      this.makeSlider('music', engine.musicVolume, (v) => engine.setMusicVolume(v)),
     );
 
     this.container.append(this.panel);
@@ -141,6 +143,7 @@ export class AudioControls {
     slider.addEventListener('input', () => {
       this.engine.resume();
       this.engine.startAmbient();
+      this.engine.startMusic();
       onChange(Number(slider.value) / 100);
     });
 
@@ -152,6 +155,7 @@ export class AudioControls {
   private readonly onToggle = (): void => {
     this.engine.resume();
     this.engine.startAmbient();
+    this.engine.startMusic();
     this.engine.toggleMute();
     this.refreshMute();
   };

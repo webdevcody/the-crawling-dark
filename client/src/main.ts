@@ -38,9 +38,11 @@ import {
   MAP_SIZE,
   TICK_MS,
   CLIENT_FPS,
+  ROUND_LENGTH_MS,
   generateWorld,
   type World,
   type EntityKind,
+  type RoundMessage,
 } from '@crawling-dark/shared';
 import { Connection } from './net/Connection';
 import { Predictor } from './predict/Predictor';
@@ -206,6 +208,7 @@ renderer.domElement.addEventListener('mousedown', (ev) => {
   // AudioContext resumes and the ambient bed starts the moment play begins.
   audio.resume();
   audio.startAmbient();
+  audio.startMusic();
   if (ev.button !== 0) return;
   if (!controls.pointerLocked) return;
   connection.sendAttack();
@@ -236,6 +239,7 @@ window.addEventListener('keydown', (ev) => {
   // so a keyboard-only player who never clicks the canvas still gets sound.
   audio.resume();
   audio.startAmbient();
+  audio.startMusic();
   localReady = !localReady;
   connection.sendReady(localReady);
 });
@@ -804,6 +808,50 @@ let inputAccumulatorMs = 0;
 let accumulatedKeys = 0;
 
 /* -------------------------------------------------------------------------- */
+/* Music intensity (M12 · t12c)                                               */
+/* -------------------------------------------------------------------------- */
+
+/** Clamp `x` into the inclusive range [0, 1]. */
+function clamp01(x: number): number {
+  return x < 0 ? 0 : x > 1 ? 1 : x;
+}
+
+/**
+ * Map the current {@link RoundMessage} to a musical intensity in [0, 1] for the
+ * {@link AudioEngine.setMusicIntensity dynamic music bed}:
+ *
+ *  - no round / `lobby` → calm (0),
+ *  - `countdown` → a faint pre-match unease (0.15),
+ *  - `active` → the greater of two pressures, so either can drive the dread:
+ *      • *attrition* — how far the humans have been overrun
+ *        (`1 - humansAlive / (humansAlive + zombieCount)`), and
+ *      • *the clock* — how much of the round has elapsed,
+ *    lifted onto a 0.25 floor so play always feels tenser than the lobby,
+ *  - `ended` → a held spike (0.95).
+ *
+ * The engine smooths every change internally, so this can be recomputed and
+ * pushed each frame without any risk of a click.
+ */
+function roundMusicIntensity(round: RoundMessage | null): number {
+  if (round === null) return 0;
+  switch (round.phase) {
+    case 'countdown':
+      return 0.15;
+    case 'active': {
+      const total = round.humansAlive + round.zombieCount;
+      const attrition = total > 0 ? 1 - round.humansAlive / total : 0;
+      const elapsed = 1 - clamp01(round.timeLeftMs / ROUND_LENGTH_MS);
+      return clamp01(0.25 + 0.75 * Math.max(attrition, elapsed));
+    }
+    case 'ended':
+      return 0.95;
+    case 'lobby':
+    default:
+      return 0;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
 /* Render loop                                                                */
 /* -------------------------------------------------------------------------- */
 
@@ -933,6 +981,12 @@ function animate(): void {
     audio.setListener(localFeet, controls.yaw);
     driveFootsteps(entities, dtMs);
   }
+
+  // 5c. Music: drive the dynamic-intensity bed off the round state (M12 · t12c).
+  //     Calm in the lobby/countdown; during play, tenser as the humans dwindle
+  //     and the clock winds down; a held spike at the end. The engine smooths
+  //     every change internally, so pushing a fresh target each frame is fine.
+  audio.setMusicIntensity(roundMusicIntensity(connection.round));
 
   // 6. Advance transient combat VFX and the turn feed, culling the expired.
   updateEffects(dtMs);
