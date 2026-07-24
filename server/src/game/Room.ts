@@ -47,6 +47,7 @@ import {
 import { Player } from './Player';
 import { Round } from './Round';
 import { ZombieAI, forwardFromYaw, type ZombieIntent } from './ai';
+import { cullByInterest } from './interest';
 
 /**
  * The single game room for The Crawling Dark (M3 · t3a/t3b/t3c).
@@ -1028,14 +1029,40 @@ export class Room {
 
   /**
    * Interest-management seam (M7 · t7c): choose which of the full entity list a
-   * given client should receive. The default sends every entity unchanged; t7c
-   * replaces the body with a per-viewer interest cull (radius/hysteresis) so
-   * distant entities are never transmitted to a client that cannot perceive
-   * them. Kept as its own hook so the culling logic composes cleanly with the
-   * encoding seam below without either rewriting the broadcast loop.
+   * given client should receive. Each playing client is sent only the entities
+   * within its interest radius on the XZ plane — its own entity always included —
+   * so the far side of the town is never transmitted to a client that cannot
+   * perceive it (see {@link cullByInterest}). Enter/exit hysteresis, carried on
+   * the viewer's {@link Player.visibleEntities} set between broadcasts, keeps
+   * boundary entities from flickering in and out of the snapshot.
+   *
+   * Two callers bypass the cull and receive the full list unchanged:
+   *  - **Spectators**, who carry no own entity and are meant to watch the whole
+   *    town, so there's no viewer position to cull around anyway; and
+   *  - the **NPC** (`socket === null`), whose snapshot is never actually sent —
+   *    skipping the work (and leaving its unused visible-set untouched) is free.
+   *
+   * The returned array is always a distinct list (either `all` itself for the
+   * bypass, or a fresh filtered array); this method never mutates `all` or its
+   * entities, which are shared across every client.
    */
-  private entitiesForClient(_player: Player, all: EntitySnapshot[]): EntitySnapshot[] {
-    return all;
+  private entitiesForClient(player: Player, all: EntitySnapshot[]): EntitySnapshot[] {
+    // Spectators watch the whole town; the NPC is never sent. Either way there's
+    // no viewer entity to cull around, so pass the full list through untouched.
+    if (player.spectator || player.socket === null) return all;
+
+    // Cull to this viewer's interest around its authoritative position, applying
+    // hysteresis against what it saw last broadcast, then remember the new set so
+    // the next broadcast's enter/exit decisions build on it.
+    const result = cullByInterest(
+      all,
+      player.id,
+      player.move.x,
+      player.move.z,
+      player.visibleEntities,
+    );
+    player.visibleEntities = result.visible;
+    return result.entities;
   }
 
   /**

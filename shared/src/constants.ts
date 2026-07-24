@@ -302,3 +302,43 @@ export const SNAPSHOT_WIRE: 'binary' | 'json' = 'binary';
  * server picks is always present locally.
  */
 export const SNAPSHOT_BASELINE_RING = 32;
+/* Interest management (M7 · t7c)                                             */
+/* -------------------------------------------------------------------------- */
+/*
+ * Per-client interest culling: a client is only sent the entities it could
+ * plausibly perceive, dropping everything on the far side of the town from its
+ * snapshot so bandwidth scales with what's *near* a player rather than the whole
+ * roster. Culling is a flat distance test on the XZ plane (ground plane) around
+ * the viewer; the viewer's own entity is never culled (the client needs its own
+ * authoritative state every snapshot for prediction/HUD).
+ *
+ * To stop an entity that hovers right at the boundary from flickering in and out
+ * of a client's snapshot each broadcast, the radius is a two-level band: an
+ * entity ENTERS interest at {@link INTEREST_RADIUS} and only EXITS once it
+ * recedes past {@link INTEREST_RADIUS} + {@link INTEREST_HYSTERESIS}. The dead
+ * band between the two is the hysteresis that gives stable enter/exit
+ * transitions (the same trick as the sprint {@link STAMINA_MIN_TO_SPRINT} gap).
+ */
+
+/**
+ * Radius (meters) at which an out-of-interest entity ENTERS a client's snapshot.
+ * Sized a touch above the NPC {@link AI_DETECTION_RADIUS} (34 m) so every entity
+ * that can currently affect the viewer's gameplay — anything close enough to
+ * chase, bat, infect, or be seen coming — is always transmitted, while the far
+ * side of the {@link MAP_SIZE} (128 m) town, which no client can perceive, is
+ * culled. With the outer band below this drops nothing within ~48 m yet still
+ * culls anything past the map's half-width (64 m).
+ */
+export const INTEREST_RADIUS = 40.0;
+
+/**
+ * Hysteresis gap (meters) added to {@link INTEREST_RADIUS} to form the OUTER
+ * exit radius: an already-visible entity is only culled once it passes
+ * `INTEREST_RADIUS + INTEREST_HYSTERESIS` (~48 m). The dead band between the
+ * inner enter radius and this outer exit radius means an entity jittering across
+ * the boundary — or a viewer strafing near it — doesn't pop the entity in and
+ * out of the snapshot every broadcast, which would otherwise flash its client
+ * rig each tick. ~8 m is comfortably wider than a snapshot's worth of movement
+ * even at {@link MOVE_SPEED_RUN}.
+ */
+export const INTEREST_HYSTERESIS = 8.0;
