@@ -813,8 +813,10 @@ function listenerAnchor(entities: Map<number, InterpolatedEntity>): Point3 {
  * entity accrues frame time and fires a step when it crosses its speed-dependent
  * interval; the {@link AudioEngine} culls anything out of earshot, so distant
  * hordes cost only the cheap bookkeeping here. Steps are surface-flavoured by
- * {@link surfaceForStep}. Also drives the land thud off the `'jump'`→ground
- * state edge (the take-off whoosh rides the `'jump'` event instead).
+ * {@link surfaceForStep}. Also drives both the take-off whoosh and the land thud
+ * off the `'jump'` state edges: the server never emits a `'jump'` *event* (only
+ * attack/stun/infect/roundStart/roundEnd), so `'jump'` is observed purely as a
+ * snapshot movement state, and both cues ride its enter/leave transitions here.
  */
 function driveFootsteps(
   entities: Map<number, InterpolatedEntity>,
@@ -823,10 +825,13 @@ function driveFootsteps(
   for (const entity of entities.values()) {
     const s = entity.state;
 
-    // Land detection: an entity that has just left the 'jump' state has touched
-    // down — a positional land thud for everyone, local + remote.
+    // Jump cues off the 'jump' state edges (there is no server 'jump' event):
+    // entering 'jump' is a take-off whoosh, leaving it is a touch-down thud —
+    // positional, for everyone, local + remote. The `prev !== undefined` guard
+    // skips a spurious whoosh for an entity first sighted already mid-jump.
     const prev = prevEntityState.get(entity.id);
-    if (prev === 'jump' && s !== 'jump') audio.land(entity);
+    if (prev !== undefined && prev !== 'jump' && s === 'jump') audio.jump(entity);
+    else if (prev === 'jump' && s !== 'jump') audio.land(entity);
     prevEntityState.set(entity.id, s);
 
     if (s !== 'walk' && s !== 'run' && s !== 'crawl') {
@@ -1119,16 +1124,6 @@ function animate(): void {
         audio.infect({ x, y, z }); // infection stinger at the victim
         audio.duck(); // dip music/ambient so the stinger reads (t12e)
         pushFeedLine(`Player #${ev.targetId ?? '?'} was turned 🧟`);
-        break;
-      }
-      case 'jump': {
-        // Positional take-off whoosh at the jumper (the return-to-ground land
-        // thud is driven off the entity's state transition in driveFootsteps).
-        const src = ev.actorId !== undefined ? entities.get(ev.actorId) : undefined;
-        const x = ev.x ?? src?.x ?? 0;
-        const y = ev.y ?? src?.y ?? 0;
-        const z = ev.z ?? src?.z ?? 0;
-        audio.jump({ x, y, z });
         break;
       }
       case 'roundStart': {
