@@ -25,6 +25,9 @@ import {
   STAMINA_DRAIN_PER_SEC,
   STAMINA_REGEN_PER_SEC,
   STAMINA_MIN_TO_SPRINT,
+  SNAPSHOT_WIRE,
+  encodeSnapshotBinary,
+  diffSnapshots,
   generateWorld,
   collideCircleXZ,
   createMoveState,
@@ -36,6 +39,7 @@ import {
   type GameEvent,
   type WelcomeMessage,
   type SnapshotMessage,
+  type DeltaSnapshot,
   type RoundMessage,
   type PongMessage,
   type WireData,
@@ -276,6 +280,15 @@ export class Room {
         // t1e: record the latest input; movement is applied by the tick loop.
         player.input = { keys: msg.keys, yaw: msg.yaw };
         player.lastSeq = Math.max(player.lastSeq, msg.seq);
+        // t7b: capture the snapshot the client has confirmed applying. Advance
+        // the confirmed baseline monotonically so a late/reordered ack can
+        // never roll it backwards; sendSnapshotTo delta-encodes against it.
+        if (msg.snapAck !== undefined) {
+          player.lastSnapAck =
+            player.lastSnapAck === undefined
+              ? msg.snapAck
+              : Math.max(player.lastSnapAck, msg.snapAck);
+        }
         break;
 
       case MessageType.Attack:
@@ -1027,11 +1040,27 @@ export class Room {
 
   /**
    * Encoding seam (M7 · t7a/t7b): serialize and send one client's snapshot.
-   * The default builds a full JSON {@link SnapshotMessage} with the recipient's
-   * personalized input `ack`. t7a/t7b replace the body with quantized binary +
-   * delta-against-last-acked encoding, tracking each client's baseline on its
-   * {@link Player}. Receives the already interest-culled `entities` for this
-   * client so encoding never has to know about culling.
+   * Receives the already interest-culled `entities` for this client so encoding
+   * never has to know about culling.
+   *
+   * Two modes, selected by the shared {@link SNAPSHOT_WIRE} flag so both sides
+   * always agree:
+   *
+   *   - `'json'` — the original behaviour: a full JSON {@link SnapshotMessage}
+   *     carrying every culled entity, personalized `ack`, and any events.
+   *   - `'binary'` — pack the snapshot into a quantized {@link ArrayBuffer}
+   *     (t7a) and, when this client has ACKed a snapshot still in its baseline
+   *     ring, DELTA-encode against that exact ACKed frame (t7b): only the
+   *     entities added/changed since the baseline plus the ids that left. With
+   *     no usable baseline yet (first frame, reconnect, or an aged-out ack) a
+   *     FULL binary frame is sent instead.
+   *
+   * The delta is diffed against the entity set THIS client was handed for the
+   * baseline tick — so an entity leaving interest naturally shows up as a
+   * removed id and one entering as a full add — and only ever against a frame
+   * the client has confirmed holding, which is what makes dropped/late acks
+   * recover cleanly. Every sent frame (full or delta) records the full culled
+   * set for `tick` so future acks can baseline against it.
    */
   private sendSnapshotTo(
     player: Player,
@@ -1039,14 +1068,57 @@ export class Room {
     entities: EntitySnapshot[],
     events: GameEvent[] | undefined,
   ): void {
-    const snapshot: SnapshotMessage = {
-      t: MessageType.Snapshot,
-      tick,
-      ack: player.lastSeq,
-      entities,
-    };
-    if (events) snapshot.events = events;
-    this.send(player, snapshot);
+    // JSON fallback: keep the original readable path verbatim on both sides.
+    if (SNAPSHOT_WIRE === 'json') {
+      const snapshot: SnapshotMessage = {
+        t: MessageType.Snapshot,
+        tick,
+        ack: player.lastSeq,
+        entities,
+      };
+      if (events) snapshot.events = events;
+      this.send(player, snapshot);
+      return;
+    }
+
+    // Binary path (t7a) + delta-against-last-acked (t7b).
+    const ack = player.lastSeq;
+    const baseline =
+      player.lastSnapAck !== undefined
+        ? player.sentSnapshots.get(player.lastSnapAck)
+        : undefined;
+
+    let buffer: ArrayBuffer;
+    if (baseline !== undefined && player.lastSnapAck !== undefined) {
+      const { changed, removed } = diffSnapshots(baseline, entities);
+      const delta: DeltaSnapshot = {
+        t: MessageType.Snapshot,
+        tick,
+        ack,
+        baselineTick: player.lastSnapAck,
+        entities: changed,
+        removed,
+      };
+      if (events) delta.events = events;
+      buffer = encodeSnapshotBinary(delta);
+    } else {
+      const full: SnapshotMessage = {
+        t: MessageType.Snapshot,
+        tick,
+        ack,
+        entities,
+      };
+      if (events) full.events = events;
+      buffer = encodeSnapshotBinary(full);
+    }
+
+    // Remember the full culled set for this tick as a future delta baseline,
+    // then ship the frame (guarding the socket like {@link send} does).
+    player.recordSentSnapshot(tick, entities);
+    const socket = player.socket;
+    if (socket !== null && socket.readyState === WebSocket.OPEN) {
+      socket.send(buffer);
+    }
   }
 
   /**
