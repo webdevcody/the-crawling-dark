@@ -408,3 +408,74 @@ the seed and still byte-for-byte identical on client and server:
   water is see-through). Used at both perception sites (`isVisible` + the `follow`
   clear-line check). The forest is a perimeter annulus with an NPC-spawn clearing,
   so it never fragments the open interior — no new A* wedging.
+
+
+## M14 notes (Phase 2 — VFX & Post-Processing)
+
+Milestone **M14** adds the missing **game-feel / VFX layer** on top of the
+M8–M13 base. It is deliberately **client-only**: no protocol, server, or
+gameplay-balance change. Every effect is driven off the existing per-frame
+render loop and the server event stream (`attack` / `stun` / `infect` /
+`roundStart` / `roundEnd`, plus the `jump` movement-state edge), and each piece
+is toggleable or degradable so it never gates the simulation. Four disjoint
+modules land the work; `main.ts` wires them together (t14e).
+
+### Post-processing pipeline (t14a)
+
+- **`client/src/scene/PostFx.ts`** wraps three's `EffectComposer`:
+  `RenderPass → UnrealBloomPass → HorrorPass (custom `ShaderPass`) → OutputPass`.
+  The single frame call in `animate` swaps `renderer.render(scene, camera)` for
+  `postFx.render(dtMs)`.
+- **M11 color pipeline preserved.** The renderer's `ACESFilmicToneMapping` +
+  `SRGBColorSpace` are left untouched. `RenderPass` draws into an offscreen
+  **linear** buffer (three only tone-maps/encodes when writing to the *canvas*),
+  the bloom + horror grade operate in linear, and **`OutputPass` applies the ACES
+  curve + sRGB encode exactly once** at the end. No double tone-map.
+- **Bloom** uses a high threshold (`~0.85`, strength `0.6`, radius `0.4`) so only
+  bright emissive — the moon disc, lamp bulbs, lit windows, and the combat VFX —
+  blooms, not the whole dim town.
+- **HorrorPass** is one custom shader doing a radial **vignette**, subtle animated
+  **film grain** (a `time` uniform advanced by `dtMs`), and a slight
+  **desaturation** for a cold night mood.
+- **`P`** toggles the whole chain (`postFx.enabled`) for an A/B / perf comparison,
+  mirroring the backtick perf overlay; when off, `render()` falls back to a bare
+  `renderer.render`. Allocation-free per frame; DPR- and resize-aware.
+
+### Pooled particle system (t14b)
+
+- **`client/src/scene/Particles.ts`** renders as **one** `THREE.Points`
+  (additive, soft round sprite, `depthWrite:false`) backed by preallocated typed
+  arrays + a packed live-count with swap-remove reaping — `MAX_PARTICLES = 512`,
+  **zero steady-state allocation**. Fade is encoded by dimming the per-vertex
+  color toward black (additive blend ⇒ dim reads as fade-out).
+- Emitters: **`sparks`** (warm bat-impact debris, from `stun`), **`spores`**
+  (sickly-green infection burst, from `infect`), and **`dust`** (available for
+  footsteps/landing).
+
+### Camera game-feel (t14c)
+
+- **`client/src/scene/CameraShake.ts`** applies a **non-accumulating** offset
+  *after* `FollowCamera.update` (which fully rewrites the camera transform each
+  frame, so the offset is wiped next frame — never drifts). Trauma model
+  (`shake = trauma²`), a decaying **FOV kick**, and a **landing punch**.
+- Smooth shake noise comes from layered `Math.sin` with fixed per-axis
+  frequencies/phases — **no `Math.random`**, allocation-free. It touches only the
+  presentation `dtMs`, never the fixed sim/prediction `dt` (so t8a is unaffected).
+- Triggers: your own swing → small FOV kick; a bat hit → sparks + a punch that is
+  hardest when *you* landed/took it and otherwise falls off with distance
+  (`traumaByProximity`); being infected → a hard jolt; round start/end horns → a
+  light jolt; the local player touching down from a jump → a landing punch.
+
+### Screen-space feedback (t14d)
+
+- **`client/src/ui/ScreenFx.ts`** is a DOM overlay (fixed, `pointer-events:none`,
+  animated via `opacity` only, dark-horror palette matching the HUD) with three
+  layers: an **infection** flash (green, ~1.2 s, on being turned), a **damage**
+  flash (red, optionally directional), and a persistent **danger** vignette whose
+  intensity `main.ts` drives every frame from `dangerIntensity` — a rising 0..1
+  ramp as the nearest zombie closes on a **human** local player
+  (`DANGER_FAR_M = 12` → `DANGER_NEAR_M = 3`), with a gentle breath pulse.
+
+All four systems are constructed once after the renderer/scene/camera, advanced
+in the frame loop, and disposed on `beforeunload`. `pnpm typecheck` + `pnpm
+build` stay green; the bundle grows ~30 KB (gzip) from the postprocessing addons.
