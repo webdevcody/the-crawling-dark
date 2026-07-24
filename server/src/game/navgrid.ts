@@ -18,10 +18,14 @@
  *     `shared/`).
  *   - **Built once per world.** The town geometry is fixed for a round, so the
  *     blocked-cell bitmap is computed a single time in the constructor and
- *     reused for every search. A cell is walkable iff its centre clears every
- *     building footprint by {@link NAV_CLEARANCE} (the body radius plus a hair),
- *     so a path keeps the NPC's cylinder off the walls, and iff it sits inside
- *     the perimeter-wall clamp.
+ *     reused for every search. A cell is walkable iff its centre sits inside the
+ *     perimeter-wall clamp and clears — by {@link NAV_CLEARANCE} (the body radius
+ *     plus a hair) — every building footprint, every forest tree, and the lake
+ *     shoreline (when water is `blocked`), so a planned path keeps the NPC's
+ *     cylinder off walls, trunks, and water alike. Buildings are tested per cell
+ *     (a few dozen AABBs); the ~740 trees and the lake are instead *scattered*
+ *     onto the grid — each disc marks only the handful of cells inside its own
+ *     footprint — so the natural pass stays cheap despite the tree count.
  *   - **8-connected, no corner cutting.** Diagonals are allowed only when both
  *     orthogonal neighbours are open, so a planned path never clips a building
  *     corner. Waypoints are the cell centres, collinear runs collapsed so a
@@ -183,6 +187,46 @@ export class NavGrid {
           }
         }
         if (solid) this.blocked[row * n + col] = 1;
+      }
+    }
+
+    // Scatter the natural obstacles (t9f). Rather than re-scan the ~740 trees for
+    // every cell, walk each tree (and the lake) ONCE and mark only the cells whose
+    // centre falls inside its inflated footprint. A tree blocks a cell within
+    // `tree.radius + clearance`; the lake blocks likewise inside its shoreline, but
+    // only when water is a solid barrier. The forest is a perimeter *annulus* and
+    // the lake a single convex disc, so this never fragments the open interior into
+    // disconnected pockets — A* just routes around them.
+    for (let i = 0; i < world.trees.length; i++) {
+      const t = world.trees[i];
+      this.markDisc(t.x, t.z, t.radius + clearance);
+    }
+    if (world.waterMode === 'blocked' && world.water !== null) {
+      const w = world.water;
+      this.markDisc(w.cx, w.cz, w.radius + clearance);
+    }
+  }
+
+  /**
+   * Scatter one solid disc (a tree trunk, or the lake shoreline) onto the blocked
+   * bitmap: mark every cell whose centre lies within `r` of (cx, cz). Only cells
+   * inside the disc's bounding square are visited — the col/row range is clamped
+   * to the grid — so marking all ~740 trees stays a handful of cells apiece rather
+   * than an O(cells) rescan per collider.
+   */
+  private markDisc(cx: number, cz: number, r: number): void {
+    const rSq = r * r;
+    const minCol = this.lineOf(cx - r);
+    const maxCol = this.lineOf(cx + r);
+    const minRow = this.lineOf(cz - r);
+    const maxRow = this.lineOf(cz + r);
+    for (let row = minRow; row <= maxRow; row++) {
+      const wz = this.centerOf(row);
+      const dz = wz - cz;
+      for (let col = minCol; col <= maxCol; col++) {
+        const wx = this.centerOf(col);
+        const dx = wx - cx;
+        if (dx * dx + dz * dz < rSq) this.blocked[row * this.cols + col] = 1;
       }
     }
   }

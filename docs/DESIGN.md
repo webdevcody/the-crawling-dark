@@ -376,5 +376,35 @@ the seed and still byte-for-byte identical on client and server:
   plaza (ring − radius ≥ 16 > 12), stays inside the town, never reaches the forest
   band, and the road grid routes around it.
 
-t9e renders all of this (instanced) on the client; t9f feeds trees/water into the
-nav grid + AI perception.
+### Client rendering — instanced environment + lake (t9d/t9e)
+
+- **Instanced forest (t9e).** `client/src/scene/Environment.ts` draws the whole
+  ~740-tree forest as **two** `InstancedMesh`es (one trunk cylinder, one foliage
+  cone), the road grid as **one** merged flat ribbon geometry, and rocks/bushes as
+  **two** more instanced meshes — so the entire natural world is ~5 extra draw
+  calls regardless of density. Scatter placement is deterministic from `world.seed`
+  (a local `mulberry32` copy, never `Math.random`) and rejection-sampled clear of
+  the plaza, buildings, lake, and roads.
+- **Bare walls dropped (t9c).** `TownView.buildTown` no longer renders the four
+  perimeter wall slabs — the forest now walls the edge. Collision is unchanged
+  (the wall is a shared clamp, never a mesh).
+- **Lake surface (t9d).** `client/src/scene/Water.ts` renders `world.water` as one
+  dark, semi-metallic disc whose ripples come from a seamlessly-tiling procedural
+  normal map scrolled each frame (a couple of scalar writes, zero per-frame
+  allocations). Wired into `main.ts` beside `buildTown`/`addStreetLights`, animated
+  in the render loop, and disposed on teardown.
+
+### Server AI — trees + lake perception (t9f)
+
+- **Nav grid.** `NavGrid` now also blocks cells within `NAV_CLEARANCE` of any tree
+  and (when water is `blocked`) the lake, via a *scatter* pass — each disc marks
+  only the cells inside its own footprint — so the natural obstacles cost a handful
+  of cells apiece rather than an O(cells) rescan. A* routes around forest + water.
+- **Steering.** The avoidance probe clearance is now `MIN(building, nearest tree,
+  lake)` per candidate heading (a server-local ray-vs-circle inflated by the body
+  radius, bound-culled), so the NPC steers around trunks and the shoreline.
+- **Line of sight.** A server-local `hasSight` = shared building LoS **AND** no
+  tree straddles the segment. Trees occlude sight; the **lake does not** (open
+  water is see-through). Used at both perception sites (`isVisible` + the `follow`
+  clear-line check). The forest is a perimeter annulus with an NPC-spawn clearing,
+  so it never fragments the open interior — no new A* wedging.

@@ -10,6 +10,12 @@
  * Buildings are plain lit boxes for now (M2 is a gameplay milestone); swapping
  * in GLTF town assets later (M6 polish) is purely a rendering change and never
  * touches collision, which only ever reads the AABB footprints.
+ *
+ * M9 (t9c) drops the bare perimeter wall slabs from the render: the dense
+ * perimeter forest (see {@link scene/Environment}) now walls the map edge, so
+ * drawing the old boundary boxes would only clip through the trees. The wall is
+ * still enforced in shared collision — it is a position clamp, never a collider —
+ * so hiding its meshes changes nothing about what the player runs into.
  */
 
 import * as THREE from 'three';
@@ -36,26 +42,22 @@ export function buildTown(world: World): THREE.Group {
   const group = new THREE.Group();
   group.name = 'town';
 
-  // Shared wall material — stony and uniform so the map edge reads as a boundary.
-  const wallMaterial = new THREE.MeshStandardMaterial({
-    color: 0x2b3540,
-    roughness: 1,
-    metalness: 0,
-  });
-
   for (const b of world.buildings) {
+    // M9 (t9c): the perimeter is now a wall of forest, so the bare boundary
+    // slabs are no longer drawn — skip them (collision is unchanged, the wall
+    // being a clamp in shared, not a mesh). Every real building still renders.
+    if (isPerimeterWall(b, world)) continue;
+
     const aabb = buildingAABB(b);
     const width = aabb.maxX - aabb.minX;
     const depth = aabb.maxZ - aabb.minZ;
     const geometry = new THREE.BoxGeometry(width, b.height, depth);
 
-    const material = isPerimeterWall(b, world)
-      ? wallMaterial
-      : new THREE.MeshStandardMaterial({
-          color: facadeColor(b.id),
-          roughness: 0.9,
-          metalness: 0,
-        });
+    const material = new THREE.MeshStandardMaterial({
+      color: facadeColor(b.id),
+      roughness: 0.9,
+      metalness: 0,
+    });
 
     const mesh = new THREE.Mesh(geometry, material);
     // Box origin is centered; lift by half the height so the base sits on y = 0.

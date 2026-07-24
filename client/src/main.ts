@@ -47,6 +47,8 @@ import { Predictor } from './predict/Predictor';
 import { Controls } from './input/Controls';
 import { FollowCamera } from './scene/FollowCamera';
 import { buildTown } from './scene/TownView';
+import { buildEnvironment, disposeEnvironment } from './scene/Environment';
+import { Water } from './scene/Water';
 import { Character } from './entities/Character';
 import {
   configureRenderer,
@@ -217,6 +219,14 @@ let lastPhase: string | null = null;
 /** The seeded town, once we know the seed; drives building meshes + camera collision. */
 let world: World | null = null;
 
+/**
+ * The M9 environment (forest / roads / scatter props) and lake surface, built
+ * alongside the town so they can be disposed together on teardown. `null` until
+ * the world exists; `water` stays `null` for a seed with no lake.
+ */
+let environment: THREE.Group | null = null;
+let water: Water | null = null;
+
 /** Build the town exactly once, as soon as the deterministic seed is known. */
 function ensureWorld(): void {
   if (world !== null) return;
@@ -226,6 +236,14 @@ function ensureWorld(): void {
   scene.add(buildTown(world));
   // M6 (t6e): warm sodium lamp posts along the streets, now that the town exists.
   addStreetLights(scene, world);
+  // M9 (t9e): the instanced forest, road ribbons, and scatter props.
+  environment = buildEnvironment(world);
+  scene.add(environment);
+  // M9 (t9d): the animated lake surface, when this seed has water.
+  if (world.water !== null) {
+    water = new Water(world.water);
+    scene.add(water.mesh);
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -889,6 +907,9 @@ function animate(): void {
   updateEffects(dtMs);
   updateFeed(dtMs);
 
+  // 6b. Ripple the lake surface (M9 · t9d) — a cheap UV scroll, no allocations.
+  water?.update(dtMs);
+
   // 7. Drive the third-person camera when we have a local body and the town.
   if (localFeet !== null && world !== null) {
     follow.update(localFeet, controls.yaw, world, dt);
@@ -935,4 +956,7 @@ window.addEventListener('beforeunload', () => {
   audioControls.dispose();
   audio.dispose();
   perf.dispose();
+  // M9 (t9d/t9e): free the environment + lake surface GPU resources.
+  if (environment !== null) disposeEnvironment(environment);
+  water?.dispose();
 });
