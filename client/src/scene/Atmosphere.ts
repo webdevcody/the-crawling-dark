@@ -44,6 +44,19 @@ const MOON_COLOR = 0xa9c7ff;
 const MOON_INTENSITY = 1.1;
 
 /**
+ * The moon's world position — and thus the direction its cold key-light rakes
+ * in from. Exported as the SINGLE SOURCE OF TRUTH so the visible moon disc in
+ * the sky (M11 · t11b) is placed along the exact same vector the light uses,
+ * keeping the glowing source and the shadows it casts in agreement. Tune this
+ * one vector and both the light and the disc follow.
+ */
+export const MOON_LIGHT_POSITION: readonly [number, number, number] = [
+  MAP_SIZE * 0.3,
+  MAP_SIZE * 0.6,
+  MAP_SIZE * 0.2,
+];
+
+/**
  * Fog band as fractions of {@link MAP_SIZE}. Denser than the old defaults
  * (0.12 → 0.9): fog now starts close (~13 m) and reaches full black by roughly
  * half the map (~70 m), so the immediate streets stay crisp while distant
@@ -159,7 +172,7 @@ export function createAtmosphere(scene: THREE.Scene): Atmosphere {
 
   // The moon: a cold key-light raking in from high on one side for long shadows.
   const moon = new THREE.DirectionalLight(MOON_COLOR, MOON_INTENSITY);
-  moon.position.set(MAP_SIZE * 0.3, MAP_SIZE * 0.6, MAP_SIZE * 0.2);
+  moon.position.set(...MOON_LIGHT_POSITION);
   moon.target.position.set(0, 0, 0);
 
   // The one and only shadow caster in the scene.
