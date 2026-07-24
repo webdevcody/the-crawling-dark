@@ -215,3 +215,56 @@ export const AI_AVOID_RAY_LENGTH = 6.0;
  * already open by the time contact lands and the infection resolves (t4c).
  */
 export const NPC_ATTACK_RANGE = 1.6;
+
+
+/* -------------------------------------------------------------------------- */
+/* NPC A* nav-grid fallback (M4 · t4d)                                         */
+/* -------------------------------------------------------------------------- */
+/*
+ * Reactive steering (t4a) flows down open streets but has the classic
+ * local-minimum failure: a building directly between the NPC and its prey, or a
+ * concave pocket where two footprints meet, can wedge it against a wall with no
+ * look-ahead heading that makes progress. t4d layers a grid-A* planner on top as
+ * a *fallback*: it engages only once the NPC has demonstrably stalled, plans a
+ * path around the obstacle, and hands the existing steerer one waypoint at a
+ * time (so body-radius avoidance still happens between waypoints). These are the
+ * tunables that decide the nav grid's resolution and when the planner kicks in.
+ */
+
+/**
+ * Nav-grid cell edge length (meters). Fine enough that the >= 6 m streets keep
+ * several open cells across their width after the {@link NAV_CLEARANCE}
+ * inflation below, coarse enough that A* over the whole map stays trivially
+ * cheap. Only the server AI reads this (the grid is never networked).
+ */
+export const NAV_CELL_SIZE = 1.5;
+
+/**
+ * How far (meters) a nav-grid cell centre must clear every building before the
+ * cell counts as walkable -- the body radius plus a hair of margin, so a planned
+ * path keeps the NPC's cylinder off the walls. Kept below STREET_HALF so a full
+ * street never inflates shut.
+ */
+export const NAV_CLEARANCE = PLAYER_RADIUS + 0.1;
+
+/**
+ * A tick counts as "no progress" when the NPC -- while actively chasing at
+ * {@link NPC_CHASE_SPEED} -- advances less than this fraction of the distance it
+ * *should* have covered unobstructed. Below it, the NPC is grinding on geometry
+ * rather than closing on prey.
+ */
+export const AI_STALL_PROGRESS_FRAC = 0.35;
+
+/**
+ * Accumulated stall time (ms) before the A* fallback engages. A short grace so a
+ * single glancing scrape off a corner doesn't trigger a replan, but the NPC
+ * never spends long wedged in a pocket.
+ */
+export const AI_STALL_ENGAGE_MS = 450;
+
+/**
+ * While the A* fallback is engaged, recompute the path at most this often (ms)
+ * or whenever the target has since moved a cell away -- cheap enough to keep the
+ * route fresh as the prey runs, without replanning every tick.
+ */
+export const AI_REPATH_INTERVAL_MS = 700;
