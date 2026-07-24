@@ -238,6 +238,16 @@ export interface RoundMessage {
   zombieCount: number;
   /** Set only when `phase === 'ended'`. */
   winner?: EntityKind;
+  /**
+   * Lobby only: how many connected (non-spectator) players have readied up.
+   * Lets the HUD show a "READY n/total" gate. Omitted outside the lobby phase.
+   */
+  readyCount?: number;
+  /**
+   * Lobby only: total connected, non-spectator players (the denominator for
+   * {@link readyCount}). Omitted outside the lobby phase.
+   */
+  playerCount?: number;
 }
 
 /** Reply to a {@link PingMessage}; `id` matches the probe. */
