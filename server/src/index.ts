@@ -1,12 +1,14 @@
 import { WebSocketServer, type WebSocket } from 'ws';
 import { DEFAULT_SERVER_PORT, TICK_RATE } from '@crawling-dark/shared';
+import { Room } from './game/Room';
 
 /**
- * Minimal authoritative WebSocket server for The Crawling Dark.
+ * Authoritative WebSocket server for The Crawling Dark (M1 · Networking Spine).
  *
- * For now it only accepts connections and logs lifecycle events with a
- * stable per-socket id. Simulation, snapshots and input handling land in
- * later tasks; this is the foundation they attach to.
+ * The socket lifecycle is thin: every connection is handed to the single
+ * {@link Room}, which owns the player registry, the fixed-timestep simulation
+ * loop, and snapshot broadcasting. This file only bridges `ws` events to the
+ * room and keeps the lifecycle logging.
  */
 
 /** Resolve the listen port from the environment, falling back to the shared default. */
@@ -23,10 +25,9 @@ function resolvePort(): number {
 
 const port = resolvePort();
 
-/** Monotonically increasing id handed to each new socket. Never reused. */
-let nextId = 1;
-/** Number of sockets currently connected. */
-let connected = 0;
+/** The single game room: registry + simulation + snapshot broadcast. */
+const room = new Room();
+room.start();
 
 const wss = new WebSocketServer({ port });
 
@@ -35,22 +36,22 @@ wss.on('listening', () => {
 });
 
 wss.on('connection', (socket: WebSocket) => {
-  const id = nextId++;
-  connected++;
-  console.log(`[server] client #${id} connected (${connected} online)`);
+  const player = room.join(socket);
+  const role = player.spectator ? ' as spectator' : '';
+  console.log(`[server] client #${player.id} connected${role} (${room.size} online)`);
 
   socket.on('message', (data) => {
-    // No protocol yet; log at a low volume so we can see traffic during dev.
-    console.log(`[server] client #${id} message (${data.toString().length} bytes)`);
+    room.handleMessage(player, data);
   });
 
   socket.on('error', (err: Error) => {
-    console.error(`[server] client #${id} error: ${err.message}`);
+    console.error(`[server] client #${player.id} error: ${err.message}`);
+    room.remove(player);
   });
 
   socket.on('close', () => {
-    connected--;
-    console.log(`[server] client #${id} disconnected (${connected} online)`);
+    room.remove(player);
+    console.log(`[server] client #${player.id} disconnected (${room.size} online)`);
   });
 });
 
