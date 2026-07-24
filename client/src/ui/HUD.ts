@@ -177,7 +177,7 @@ export class HUD {
     this.statusDot = document.createElement('span');
     this.statusDot.textContent = '● ';
     const title = document.createElement('b');
-    title.textContent = 'The Crawling Dark · M5';
+    title.textContent = 'The Crawling Dark · M6';
     header.append(this.statusDot, title);
     this.panel.append(header);
 

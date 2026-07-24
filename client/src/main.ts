@@ -1,5 +1,5 @@
 /**
- * The Crawling Dark — client entry point (M3 · Combat & Infection demo).
+ * The Crawling Dark — client entry point (M6 · Prediction & Polish).
  *
  * Wires the M2 systems into a playable third-person scene:
  *   - the seeded town ({@link buildTown}) rendered from the same {@link World}
@@ -8,8 +8,8 @@
  *     frames (held-key bitmask + look yaw) streamed every frame;
  *   - a third-person spring-arm follow camera ({@link FollowCamera}) that trails
  *     the local player and retracts around walls;
- *   - remote (and local) entities rendered from interpolated snapshots
- *     (~INTERP_BUFFER_MS in the past) so everyone moves smoothly.
+ *   - remote entities rendered from interpolated snapshots (~INTERP_BUFFER_MS in
+ *     the past) so everyone moves smoothly; the LOCAL player is client-predicted.
  *
  * M3 (t3d) layers combat on top: left-click sends an ATTACK; bodies are colored
  * by team (human vs zombie) and repaint the instant an infection flips a body's
@@ -24,9 +24,13 @@
  * (streamed via {@link Connection.sendReady}); the flag resets whenever the
  * round returns to `lobby`, matching the server clearing readiness on reset.
  *
- * There is no client-side prediction yet — the local player is also drawn from
- * interpolated server state, so it lags input slightly. Prediction/reconciliation
- * is M6 (t6a); until then this is the interpolation-only MVP the design calls for.
+ * M6 makes it feel good: the local player is now client-predicted + reconciled
+ * ({@link Predictor}, t6a) so it responds instantly; entities are drawn as rigged,
+ * animated {@link Character} rigs (t6c); the HUD shows a server-authoritative
+ * stamina bar (t6b); a procedural {@link AudioEngine} adds footsteps, combat SFX,
+ * and a dark-town ambient bed (t6d); and the mood pass — one shadow-casting moon,
+ * close fog, and warm street lamps ({@link createAtmosphere}, t6e) — sells the
+ * crawling dark.
  */
 
 import * as THREE from 'three';
@@ -307,8 +311,8 @@ function syncEntities(
 /**
  * One live visual effect: a throwaway mesh that grows and/or spins as it ages
  * and fades out over its lifetime, after which it is removed and its geometry +
- * material are disposed. Each effect owns UNIQUE geometry, so disposal can never
- * touch the shared PLAYER_GEOMETRY. {@link updateEffects} advances the pool.
+ * material are disposed. Each effect owns UNIQUE geometry (never a shared one), so
+ * its disposal is always self-contained. {@link updateEffects} advances the pool.
  */
 interface Effect {
   mesh: THREE.Mesh;
