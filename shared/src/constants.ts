@@ -161,6 +161,21 @@ export const ROUND_END_SEC = 10;
 /** Post-round length in milliseconds (derived from {@link ROUND_END_SEC}). */
 export const ROUND_END_MS = ROUND_END_SEC * 1000;
 
+/**
+ * Grace window (ms) a *dropped* active player is held in the world before a
+ * disconnect becomes a real removal / forfeit (M7 · t7d). On a socket close the
+ * server does NOT delete the entity immediately: it freezes the player (held
+ * keys treated as none so it stands idle instead of running on stale input) and
+ * counts this window down one {@link TICK_MS} per tick. A reconnect presenting
+ * the player's session token inside the window reclaims the same
+ * id/team/position; if the window elapses first, the player is removed through
+ * the normal path so the round/win logic sees it leave. Spectators and NPCs are
+ * unaffected — they keep the immediate-remove behavior. Ten seconds is long
+ * enough to ride out a brief network blip or a page reload without abandoning
+ * teammates for the rest of the round.
+ */
+export const RECONNECT_GRACE_MS = 10000;
+
 /* -------------------------------------------------------------------------- */
 /* World & server                                                             */
 /* -------------------------------------------------------------------------- */

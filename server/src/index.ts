@@ -36,21 +36,29 @@ wss.on('listening', () => {
 });
 
 wss.on('connection', (socket: WebSocket) => {
-  const player = room.join(socket);
+  // The Room hands back the player for THIS socket. `player` is a `let` because
+  // a reconnect can migrate the socket onto a still-present, in-grace player
+  // (M7 · t7d): `handleMessage` returns that restored player, and we re-point
+  // this connection's closures at it so every subsequent message — and the
+  // eventual disconnect — routes to the correct identity, not the throwaway
+  // record `join` created for the raw socket.
+  let player = room.join(socket);
   const role = player.spectator ? ' as spectator' : '';
   console.log(`[server] client #${player.id} connected${role} (${room.size} online)`);
 
   socket.on('message', (data) => {
-    room.handleMessage(player, data);
+    player = room.handleMessage(player, data);
   });
 
   socket.on('error', (err: Error) => {
     console.error(`[server] client #${player.id} error: ${err.message}`);
-    room.remove(player);
+    // Not an immediate delete: for an active player this opens the reconnect
+    // grace window; spectators/NPCs are still removed at once (see Room.disconnect).
+    room.disconnect(player);
   });
 
   socket.on('close', () => {
-    room.remove(player);
+    room.disconnect(player);
     console.log(`[server] client #${player.id} disconnected (${room.size} online)`);
   });
 });
