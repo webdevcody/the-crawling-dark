@@ -125,6 +125,14 @@ export interface EntitySnapshot {
   /** Facing angle around the Y axis, in radians. */
   yaw: number;
   state: EntityState;
+  /**
+   * Sprint stamina as a fraction in `[0, 1]` (1 = full, 0 = spent), fully
+   * server-authoritative. It drains while this entity actually sprints and
+   * regenerates otherwise (see {@link STAMINA_MAX} and its siblings), and it
+   * gates sprint on the server — the client only mirrors it in the HUD bar.
+   * NPCs never sprint, so they always report {@link STAMINA_MAX}.
+   */
+  stamina: number;
 }
 
 /* -------------------------------------------------------------------------- */

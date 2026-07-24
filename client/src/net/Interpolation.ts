@@ -38,6 +38,12 @@ export interface InterpolatedEntity {
   z: number;
   yaw: number;
   state: EntitySnapshot['state'];
+  /**
+   * Sprint stamina fraction (0..1), mirrored straight from the snapshot. Lerped
+   * between straddling snapshots like the positional fields so the HUD bar reads
+   * as a smooth drain/regen rather than stepping at the snapshot cadence.
+   */
+  stamina: number;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -184,6 +190,7 @@ export class SnapshotInterpolator {
         y: lerp(ea.y, eb.y, alpha),
         z: lerp(ea.z, eb.z, alpha),
         yaw: ea.yaw + shortestAngle(ea.yaw, eb.yaw) * alpha,
+        stamina: lerp(ea.stamina, eb.stamina, alpha),
       });
     }
 
@@ -198,6 +205,7 @@ export class SnapshotInterpolator {
         y: eb.y,
         z: eb.z,
         yaw: eb.yaw,
+        stamina: eb.stamina,
       });
     }
 
@@ -228,6 +236,7 @@ function snapshotToMap(
       y: e.y,
       z: e.z,
       yaw: e.yaw,
+      stamina: e.stamina,
     });
   }
   return out;
