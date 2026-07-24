@@ -22,7 +22,7 @@
  */
 
 import * as THREE from 'three';
-import { MAP_SIZE, type World } from '@crawling-dark/shared';
+import { MAP_SIZE, type Building, type World } from '@crawling-dark/shared';
 
 /* -------------------------------------------------------------------------- */
 /* Palette + tunables                                                          */
@@ -32,16 +32,42 @@ import { MAP_SIZE, type World } from '@crawling-dark/shared';
  * The near-black the sky, fog and background all share, so distant geometry
  * fades seamlessly into the void with no visible fog "wall". Matches the value
  * `main.ts` previously set inline as `DARK` (0x05070a).
+ *
+ * M11 (t11e): EXPORTED as the single source of truth for the horizon/fog color.
+ * `Sky.ts` imports it for the skydome's horizon stop so the town dissolving into
+ * fog and the sky's horizon resolve to the exact same pixels — the seam-free
+ * join can never drift out of sync with a second hardcoded copy.
  */
-const DARK = 0x05070a;
+export const DARK = 0x05070a;
 
 /** Cold blue-grey bounce fill. Kept dim so shadows stay deep, but never zero — pitch black is unplayable. */
 const AMBIENT_COLOR = 0x2a3846;
-const AMBIENT_INTENSITY = 0.45;
+// M11 (t11c): nudged 0.45 → 0.55. ACES filmic tone-mapping (main.ts) darkens the
+// low end, so the shadowed, ambient-only sides of buildings crushed toward black;
+// a small lift keeps them legibly dark-blue rather than pure void, without turning
+// the night milky (the dark AMBIENT_COLOR still holds the shadows down).
+const AMBIENT_INTENSITY = 0.55;
 
 /** The moon: a pale, cold key-light raking across the town from high up. */
 const MOON_COLOR = 0xa9c7ff;
-const MOON_INTENSITY = 1.1;
+// M11 (t11c): nudged 1.1 → 1.25. ACES rolls off the brightest values, so the
+// former 1.1 key-light lost punch on moonlit faces; +0.15 restores the raking
+// contrast while the filmic highlight roll-off keeps directly-lit faces from
+// clipping to flat white.
+const MOON_INTENSITY = 1.25;
+
+/**
+ * The moon's world position — and thus the direction its cold key-light rakes
+ * in from. Exported as the SINGLE SOURCE OF TRUTH so the visible moon disc in
+ * the sky (M11 · t11b) is placed along the exact same vector the light uses,
+ * keeping the glowing source and the shadows it casts in agreement. Tune this
+ * one vector and both the light and the disc follow.
+ */
+export const MOON_LIGHT_POSITION: readonly [number, number, number] = [
+  MAP_SIZE * 0.3,
+  MAP_SIZE * 0.6,
+  MAP_SIZE * 0.2,
+];
 
 /**
  * Fog band as fractions of {@link MAP_SIZE}. Denser than the old defaults
@@ -84,26 +110,58 @@ const LAMP_DISTANCE = 22;
 const LAMP_DECAY = 2;
 
 /**
- * Deterministic lamp positions in world XZ, chosen to sit ON the town's street
- * grid so no bulb ever lands inside a building footprint. The town is a 6×6
- * block grid over [-54, 54] (cell size 18 m); the gaps between blocks — the
- * streets — run along x/z ∈ {0, ±18, ±36}, and the central plaza (radius 12 m)
- * is guaranteed building-free. These offsets place four lamps at the mouths of
- * the two main cross-streets where they meet the plaza, and four more at the
- * next ring of street intersections, giving symmetric coverage of the core.
+ * Road-walking placement (M11 t11d). Rather than a fixed offset list, lamps are
+ * stepped DETERMINISTICALLY along the town's road polylines (World.roads) at
+ * LAMP_SPACING-metre intervals, so the lighting follows wherever the M9 street
+ * network actually runs. At the road grid's 18 m cell size this lands one lamp
+ * at (essentially) every street intersection, giving even coverage of the core
+ * and the outskirts alike without a single hand-placed coordinate.
+ *
+ * Two spacings govern the sweep:
+ *   - LAMP_SPACING - the target gap between consecutive lamps ALONG a segment.
+ *     Each segment is subdivided into evenly-spaced lamps that always include
+ *     both endpoints, so every road intersection gets lit.
+ *   - LAMP_MERGE_DIST - any candidate within this radius of an already-placed
+ *     lamp is dropped, collapsing the duplicate lamps that otherwise pile up
+ *     where two lanes (or a lane and the ring road) cross.
  */
-const LAMP_OFFSETS: ReadonlyArray<readonly [number, number]> = [
-  // Plaza mouths — cardinal, just outside the 12 m plaza on the main streets.
-  [14, 0],
-  [-14, 0],
-  [0, 14],
-  [0, -14],
-  // Next ring — diagonal street intersections at x=±18, z=±18 (both clear lanes).
-  [18, 18],
-  [-18, 18],
-  [18, -18],
-  [-18, -18],
-];
+const LAMP_SPACING = 18;
+const LAMP_MERGE_DIST = 3;
+
+/**
+ * Keep the guaranteed-clear spawn plaza centre free of a physical post: players
+ * spawn on a ~4 m ring around the origin, so the lone candidate that lands
+ * exactly at (0, 0) (the central crossroads) is skipped. Every other lamp is at
+ * least one 18 m cell out, so this only ever removes that single centre lamp.
+ */
+const LAMP_ORIGIN_CLEARANCE = 5;
+
+/**
+ * Live-PointLight budget for the WHOLE street-light system (road lamps plus the
+ * pooled building lights below) - the guard that keeps the frame budget intact.
+ * A road-walked town yields dozens of lamp POSTS, but posts + emissive bulbs are
+ * cheap (shared geometry, no light) whereas real point lights are not. So only
+ * the MAX_LAMP_LIGHTS sources nearest the core actually get a THREE.PointLight;
+ * every lamp beyond the budget is a post + glowing bulb only, which still reads
+ * as a light source at zero lighting cost. NONE of these lights cast shadows, so
+ * the scene keeps its single shadow caster: the moon.
+ */
+const MAX_LAMP_LIGHTS = 18;
+
+/**
+ * Optional pooled warm light near the tallest buildings: a handful of cheap,
+ * NON-shadow point lights that sit in the street on the plaza-facing side of the
+ * biggest towers so their facades and the pavement below read as lit-from-within.
+ * These are drawn from the SAME MAX_LAMP_LIGHTS budget (they are counted first),
+ * so adding them never grows the total live-light count. The perimeter walls are
+ * the shortest 'buildings', so a tallest-first pick never selects one.
+ */
+const MAX_BUILDING_LIGHTS = 4;
+const BUILDING_LIGHT_COLOR = 0xffd9a0;
+const BUILDING_LIGHT_INTENSITY = 42;
+const BUILDING_LIGHT_DISTANCE = 34;
+const BUILDING_LIGHT_HEIGHT = 9;
+const BUILDING_LIGHT_DECAY = 2;
 
 /* -------------------------------------------------------------------------- */
 /* Renderer                                                                    */
@@ -148,9 +206,19 @@ export function createAtmosphere(scene: THREE.Scene): Atmosphere {
   const dark = new THREE.Color(DARK);
 
   // Background and fog share the same near-black so the far edge of the town
-  // dissolves into the sky with no seam.
+  // dissolves into the sky with no seam. The visible skydome (Sky.ts) paints
+  // over this background; keeping `scene.background = dark` is the fallback for
+  // the one frame before the sky is built and for any pixel the dome misses.
   scene.background = dark;
   // Linear fog: crisp up close, fully black by ~half the map — the "crawling dark".
+  //
+  // M11 (t11e): this fog band is now the SINGLE control over how the town
+  // dissolves. The sky, stars and moon (Sky.ts) all render with `fog: false`,
+  // so they stay fully visible no matter how dense the fog is — the near/far
+  // fractions only govern the town/forest fade, and because the fog color is
+  // the shared DARK == the sky's horizon color, the dissolve lands seamlessly
+  // on the horizon. Left at the M6-tuned band (close + tense) after verifying
+  // stars + moon + lamps all coexist against it.
   scene.fog = new THREE.Fog(dark, MAP_SIZE * FOG_NEAR_FRAC, MAP_SIZE * FOG_FAR_FRAC);
 
   // Dim cool fill so shadowed sides stay just barely legible (never pitch black).
@@ -159,7 +227,7 @@ export function createAtmosphere(scene: THREE.Scene): Atmosphere {
 
   // The moon: a cold key-light raking in from high on one side for long shadows.
   const moon = new THREE.DirectionalLight(MOON_COLOR, MOON_INTENSITY);
-  moon.position.set(MAP_SIZE * 0.3, MAP_SIZE * 0.6, MAP_SIZE * 0.2);
+  moon.position.set(...MOON_LIGHT_POSITION);
   moon.target.position.set(0, 0, 0);
 
   // The one and only shadow caster in the scene.
@@ -181,8 +249,14 @@ export function createAtmosphere(scene: THREE.Scene): Atmosphere {
 
   // Nudge samples off the surface to kill acne on the big flat faces/ground; the
   // small magnitudes avoid detaching shadows from their casters (peter-panning).
+  // M11 (t11c): the brighter moon above raises shadow contrast, so any acne on
+  // grazing faces reads more; normalBias 0.02 → 0.03 offsets a little further along
+  // the surface normal to suppress it — still well under one shadow texel (~68 mm
+  // at a 140 m frustum / 2048² map), so the thin lamp-post shadows do not peter-pan.
+  // `bias` is left at -0.0005: it was already clean, and depth-bias over a wide
+  // ortho frustum is the axis more prone to peter-panning if pushed.
   moon.shadow.bias = -0.0005;
-  moon.shadow.normalBias = 0.02;
+  moon.shadow.normalBias = 0.03;
 
   scene.add(moon);
   scene.add(moon.target);
@@ -195,78 +269,200 @@ export function createAtmosphere(scene: THREE.Scene): Atmosphere {
 /* -------------------------------------------------------------------------- */
 
 /**
- * Build a single lamp post at world (x, z): a thin dark cylinder topped by a
- * self-lit warm bulb, with a warm {@link THREE.PointLight} at the bulb. The bulb
- * is emissive so the SOURCE is visibly glowing even though the point light — for
- * performance — casts no shadow. The post grounds the light visually and does
- * cast the moon's shadow (it is cheap and thin); the glowing bulb does not, so
- * the light source never shadows itself. Returned as a group for the caller.
+ * Shared lamp resources: one geometry + material for every post, and one for
+ * every bulb. A road-walked town places dozens of lamps, so reusing these
+ * (instead of allocating a fresh geometry/material per lamp, as the old
+ * fixed-offset list did) keeps the memory + GC cost flat as the lamp count grows.
  */
-function makeLamp(x: number, z: number): THREE.Group {
+interface LampResources {
+  postGeo: THREE.CylinderGeometry;
+  postMat: THREE.MeshStandardMaterial;
+  bulbGeo: THREE.SphereGeometry;
+  bulbMat: THREE.MeshStandardMaterial;
+}
+
+/**
+ * Build a single lamp at world (x, z): a thin dark post topped by a self-lit warm
+ * bulb, optionally with a warm THREE.PointLight at the bulb. The bulb is emissive
+ * so the SOURCE is visibly glowing on EVERY lamp - including the budget-excluded
+ * ones that carry no point light - so the whole street network reads as lit. The
+ * post grounds the lamp visually and DOES cast the moon's shadow (thin and cheap);
+ * the bulb and the point light do NOT, so the light source never shadows itself
+ * and the moon stays the scene's one and only shadow caster.
+ *
+ * @param withLight when true, attach a (non-shadow) point light at the bulb; when
+ *   false the lamp is post + glowing bulb only, at zero lighting cost.
+ */
+function makeLamp(
+  x: number,
+  z: number,
+  withLight: boolean,
+  res: LampResources,
+): THREE.Group {
   const lamp = new THREE.Group();
   lamp.position.set(x, 0, z);
 
-  // Post: a thin, dark, matte cylinder standing on the ground.
-  const postGeo = new THREE.CylinderGeometry(0.09, 0.11, LAMP_HEIGHT, 6);
-  const postMat = new THREE.MeshStandardMaterial({
-    color: 0x20262e,
-    roughness: 0.85,
-    metalness: 0.3,
-  });
-  const post = new THREE.Mesh(postGeo, postMat);
-  post.position.y = LAMP_HEIGHT / 2; // centered geometry → lift so the base sits on y = 0
+  // Post: a thin, dark, matte cylinder standing on the ground. Centered geometry
+  // is lifted so the base sits on y = 0. Casts the moon's shadow (cheap and thin).
+  const post = new THREE.Mesh(res.postGeo, res.postMat);
+  post.position.y = LAMP_HEIGHT / 2;
   post.castShadow = true;
   post.receiveShadow = false;
   lamp.add(post);
 
-  // Bulb: a small emissive sphere at the top, the visible warm glow.
-  const bulbGeo = new THREE.SphereGeometry(0.22, 12, 8);
-  const bulbMat = new THREE.MeshStandardMaterial({
-    color: LAMP_COLOR,
-    emissive: LAMP_COLOR,
-    emissiveIntensity: 2.2, // self-lit so it reads as the source, not a lit ball
-    roughness: 0.4,
-    metalness: 0,
-  });
-  const bulb = new THREE.Mesh(bulbGeo, bulbMat);
-  bulb.position.y = LAMP_HEIGHT; // seated at the top of the post
+  // Bulb: a small emissive sphere at the top, the visible warm glow. Present on
+  // every lamp so even a light-less post still reads as a source, not a dark pole.
+  const bulb = new THREE.Mesh(res.bulbGeo, res.bulbMat);
+  bulb.position.y = LAMP_HEIGHT;
   lamp.add(bulb);
 
-  // The actual light: warm, modest reach, inverse-square falloff, NO shadow.
-  const light = new THREE.PointLight(
-    LAMP_COLOR,
-    LAMP_INTENSITY,
-    LAMP_DISTANCE,
-    LAMP_DECAY,
-  );
-  light.position.y = LAMP_HEIGHT;
-  light.castShadow = false; // exactly one shadow caster in the scene (the moon)
-  lamp.add(light);
+  // The actual light is budget-gated: warm, modest reach, inverse-square falloff,
+  // and - like every lamp light - NO shadow (exactly one shadow caster: the moon).
+  if (withLight) {
+    const light = new THREE.PointLight(
+      LAMP_COLOR,
+      LAMP_INTENSITY,
+      LAMP_DISTANCE,
+      LAMP_DECAY,
+    );
+    light.position.y = LAMP_HEIGHT;
+    light.castShadow = false;
+    lamp.add(light);
+  }
 
   return lamp;
 }
 
 /**
- * Scatter the {@link LAMP_OFFSETS} street lamps around the town and add them to
- * the scene as one 'streetlights' group. Positions are fixed and deterministic
- * (identical every run for a given town) and sit on the street grid, so no lamp
- * ever lands inside a building; `world.half` is used only as a safety clamp so a
- * future tweak to the offsets can never push a lamp past the perimeter wall.
+ * Walk every road polyline and return the deterministic set of lamp XZ positions.
+ * Each segment is subdivided into evenly-spaced lamps (target gap LAMP_SPACING,
+ * always including both endpoints so intersections are lit); every candidate is
+ * clamped a couple of metres inside the perimeter wall, has the spawn-plaza
+ * centre skipped, and is deduped against already-placed lamps within
+ * LAMP_MERGE_DIST so the pile-ups at road crossings collapse to a single lamp.
  *
- * Call this once, right after the town is built, from `ensureWorld()` in
- * `main.ts` (the lamps reference the town's coordinate frame, so the world must
- * exist first).
+ * Ordering is fixed (roads array order, then along-segment order), so the result
+ * - and therefore which lamps fall inside the light budget - is identical every
+ * run for a given world; nothing here touches Math.random.
+ */
+function collectLampPositions(world: World): Array<{ x: number; z: number }> {
+  const limit = world.half - 2;
+  const positions: Array<{ x: number; z: number }> = [];
+
+  const tryAdd = (rawX: number, rawZ: number): void => {
+    // Clamp inside the perimeter wall. Roads never reach it, so this is purely a
+    // guard against a future road tweak pushing a lamp through the wall.
+    const x = Math.max(-limit, Math.min(limit, rawX));
+    const z = Math.max(-limit, Math.min(limit, rawZ));
+    // Keep the spawn-plaza centre clear of a physical post.
+    if (Math.hypot(x, z) < LAMP_ORIGIN_CLEARANCE) return;
+    // Drop duplicates piled up where roads cross.
+    for (const p of positions) {
+      if (Math.hypot(p.x - x, p.z - z) < LAMP_MERGE_DIST) return;
+    }
+    positions.push({ x, z });
+  };
+
+  for (const road of world.roads) {
+    const pts = road.points;
+    for (let i = 0; i + 1 < pts.length; i++) {
+      const a = pts[i];
+      const b = pts[i + 1];
+      const dx = b.x - a.x;
+      const dz = b.z - a.z;
+      const len = Math.hypot(dx, dz);
+      if (len < 1e-6) continue;
+      // Even subdivision including both ends: round the target spacing to fit the
+      // segment exactly, so the along-street gap stays close to LAMP_SPACING.
+      const steps = Math.max(1, Math.round(len / LAMP_SPACING));
+      for (let s = 0; s <= steps; s++) {
+        const t = s / steps;
+        tryAdd(a.x + dx * t, a.z + dz * t);
+      }
+    }
+  }
+
+  return positions;
+}
+
+/**
+ * A cheap pooled warm light for one tall building: a NON-shadow point light set
+ * in the street just outside the tower's footprint on the plaza-facing (toward
+ * origin) side, so it lights the facade and pavement instead of being trapped
+ * inside the box. Like every street light it casts no shadow (the moon is the
+ * sole shadow caster).
+ */
+function makeBuildingLight(b: Building): THREE.PointLight {
+  const light = new THREE.PointLight(
+    BUILDING_LIGHT_COLOR,
+    BUILDING_LIGHT_INTENSITY,
+    BUILDING_LIGHT_DISTANCE,
+    BUILDING_LIGHT_DECAY,
+  );
+  // Push out of the footprint toward the origin (guard the degenerate centre).
+  const d = Math.hypot(b.cx, b.cz);
+  const ux = d > 1e-6 ? b.cx / d : 0;
+  const uz = d > 1e-6 ? b.cz / d : 0;
+  const out = Math.max(b.hw, b.hd) + 2;
+  light.position.set(b.cx - ux * out, BUILDING_LIGHT_HEIGHT, b.cz - uz * out);
+  light.castShadow = false; // exactly one shadow caster in the scene (the moon)
+  return light;
+}
+
+/**
+ * Light the town along its M9 road network. Lamps are stepped deterministically
+ * along World.roads (see collectLampPositions) and added to the scene as one
+ * 'streetlights' group; a strict MAX_LAMP_LIGHTS budget of live point lights is
+ * spent core-first (nearest the origin), plus up to MAX_BUILDING_LIGHTS pooled
+ * warm lights at the tallest towers - every one of them a NON-shadow light, so
+ * the moon remains the scene's single shadow caster. Lamps beyond the budget are
+ * posts + emissive bulbs only, so the streets read as fully lit at a fixed,
+ * capped lighting cost.
+ *
+ * Call this once, right after the town is built, from ensureWorld() in main.ts
+ * (the lamps reference the town's coordinate frame, so the world must exist).
  */
 export function addStreetLights(scene: THREE.Scene, world: World): THREE.Group {
   const group = new THREE.Group();
   group.name = 'streetlights';
 
-  // Keep every lamp a couple meters inside the perimeter wall, whatever offsets say.
-  const limit = world.half - 2;
+  // Shared geometry/material for every post and every bulb (see LampResources).
+  const res: LampResources = {
+    postGeo: new THREE.CylinderGeometry(0.09, 0.11, LAMP_HEIGHT, 6),
+    postMat: new THREE.MeshStandardMaterial({
+      color: 0x20262e,
+      roughness: 0.85,
+      metalness: 0.3,
+    }),
+    bulbGeo: new THREE.SphereGeometry(0.22, 12, 8),
+    bulbMat: new THREE.MeshStandardMaterial({
+      color: LAMP_COLOR,
+      emissive: LAMP_COLOR,
+      emissiveIntensity: 2.2,
+      roughness: 0.4,
+      metalness: 0,
+    }),
+  };
 
-  for (const [x, z] of LAMP_OFFSETS) {
-    if (Math.abs(x) > limit || Math.abs(z) > limit) continue;
-    group.add(makeLamp(x, z));
+  // Pooled building lights claim the FRONT of the light budget: pick the tallest
+  // towers (walls are the shortest buildings, so they never make the cut).
+  let lightBudget = MAX_LAMP_LIGHTS;
+  const towers = world.buildings
+    .slice()
+    .sort((p, q) => q.height - p.height)
+    .slice(0, Math.min(MAX_BUILDING_LIGHTS, MAX_LAMP_LIGHTS));
+  for (const b of towers) {
+    group.add(makeBuildingLight(b));
+    lightBudget--;
+  }
+
+  // Road-walked lamps, nearest-the-core first: the first `lightBudget` get a real
+  // point light; the rest are post + glowing bulb only.
+  const positions = collectLampPositions(world);
+  positions.sort((p, q) => Math.hypot(p.x, p.z) - Math.hypot(q.x, q.z));
+  for (let i = 0; i < positions.length; i++) {
+    const p = positions[i];
+    group.add(makeLamp(p.x, p.z, i < lightBudget, res));
   }
 
   scene.add(group);
