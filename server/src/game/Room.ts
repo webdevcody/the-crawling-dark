@@ -966,6 +966,34 @@ export class Room {
    * into this snapshot's optional `events`. `ack` is personalized per recipient.
    */
   private broadcastSnapshot(): void {
+    // 1) Build the full authoritative entity list once (see collectEntities).
+    const entities = this.collectEntities();
+
+    // Drain the event buffer; only attach `events` when non-empty so idle
+    // snapshots stay lean. Slice so each broadcast owns an immutable copy.
+    const events = this.events.length > 0 ? this.events.slice() : undefined;
+    this.events.length = 0;
+
+    const tick = this.tick;
+    for (const p of this.players.values()) {
+      // 2) Interest management seam (M7 · t7c): pick the entities THIS client
+      //    should receive from the full list. Default: the whole list.
+      const forClient = this.entitiesForClient(p, entities);
+      // 3) Encoding seam (M7 · t7a/t7b): serialize + send this client's
+      //    snapshot. Default: a full JSON SnapshotMessage.
+      this.sendSnapshotTo(p, tick, forClient, events);
+    }
+
+    this.broadcastRound();
+  }
+
+  /**
+   * Build one full authoritative snapshot of every simulated (non-spectator)
+   * entity. Positions come straight from each player's collision-resolved
+   * {@link MoveState}; `kind` reflects the team and `state` folds in combat
+   * states. This is the single source the per-client seams below consume.
+   */
+  private collectEntities(): EntitySnapshot[] {
     const entities: EntitySnapshot[] = [];
     for (const p of this.players.values()) {
       if (p.spectator) continue;
@@ -982,25 +1010,43 @@ export class Room {
         stamina: p.stamina,
       });
     }
+    return entities;
+  }
 
-    // Drain the event buffer; only attach `events` when non-empty so idle
-    // snapshots stay lean. Slice so each broadcast owns an immutable copy.
-    const events = this.events.length > 0 ? this.events.slice() : undefined;
-    this.events.length = 0;
+  /**
+   * Interest-management seam (M7 · t7c): choose which of the full entity list a
+   * given client should receive. The default sends every entity unchanged; t7c
+   * replaces the body with a per-viewer interest cull (radius/hysteresis) so
+   * distant entities are never transmitted to a client that cannot perceive
+   * them. Kept as its own hook so the culling logic composes cleanly with the
+   * encoding seam below without either rewriting the broadcast loop.
+   */
+  private entitiesForClient(_player: Player, all: EntitySnapshot[]): EntitySnapshot[] {
+    return all;
+  }
 
-    const tick = this.tick;
-    for (const p of this.players.values()) {
-      const snapshot: SnapshotMessage = {
-        t: MessageType.Snapshot,
-        tick,
-        ack: p.lastSeq,
-        entities,
-      };
-      if (events) snapshot.events = events;
-      this.send(p, snapshot);
-    }
-
-    this.broadcastRound();
+  /**
+   * Encoding seam (M7 · t7a/t7b): serialize and send one client's snapshot.
+   * The default builds a full JSON {@link SnapshotMessage} with the recipient's
+   * personalized input `ack`. t7a/t7b replace the body with quantized binary +
+   * delta-against-last-acked encoding, tracking each client's baseline on its
+   * {@link Player}. Receives the already interest-culled `entities` for this
+   * client so encoding never has to know about culling.
+   */
+  private sendSnapshotTo(
+    player: Player,
+    tick: number,
+    entities: EntitySnapshot[],
+    events: GameEvent[] | undefined,
+  ): void {
+    const snapshot: SnapshotMessage = {
+      t: MessageType.Snapshot,
+      tick,
+      ack: player.lastSeq,
+      entities,
+    };
+    if (events) snapshot.events = events;
+    this.send(player, snapshot);
   }
 
   /**
