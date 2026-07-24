@@ -312,24 +312,30 @@ function ensureWorld(): void {
 /* -------------------------------------------------------------------------- */
 
 /**
- * THE single M13 (t13a) renderer switch: how entity bodies are drawn.
- * `'procedural'` keeps the built-in articulated rig ({@link Character}) — the
- * offline-safe default with zero asset dependency, so the bundled build renders
- * exactly as before. `'gltf'` renders rigged models from `client/public/models/`
- * via {@link GltfCharacter}, which itself falls back to the procedural rig
- * per-body whenever an asset is missing. Both sides honor the {@link CharacterModel}
- * seam, so NOTHING else in this file changes when it flips — and, because the
- * heavy GLTFLoader is imported dynamically inside {@link GltfCharacter}, leaving
- * this on `'procedural'` keeps it out of the main bundle.
+ * THE single M13 renderer switch: how entity bodies are drawn.
+ * `'gltf'` (the M13 default) renders the rigged models from
+ * `client/public/models/` via {@link GltfCharacter} — the improved human
+ * (t13b) and distinct hunched zombie (t13c) baked by `scripts/gen-*-glb.mjs`.
+ * It falls back to the procedural rig PER BODY whenever an asset is missing, so
+ * it stays offline-safe. `'procedural'` keeps the built-in articulated rig
+ * ({@link Character}) with zero asset dependency; because the heavy GLTFLoader
+ * is imported dynamically inside {@link GltfCharacter}, setting this back to
+ * `'procedural'` also keeps the loader out of the main bundle. Both values
+ * honor the {@link CharacterModel} seam, so NOTHING else in this file changes.
  */
-const CHARACTER_RENDERER: 'procedural' | 'gltf' = 'procedural';
+const CHARACTER_RENDERER: 'procedural' | 'gltf' = 'gltf';
 
 /**
- * Model URLs used only when {@link CHARACTER_RENDERER} is `'gltf'`. One model
- * serves both teams (distinguished by the per-instance team recolor); adding a
- * distinct `zombie` URL makes an infection model-swap instead.
+ * Model URLs used when {@link CHARACTER_RENDERER} is `'gltf'`. The distinct
+ * `zombie` URL makes an infection MODEL-SWAP (t13c) — a human's upright,
+ * bat-carrying body (t13b) becomes the hunched zombie — on top of the
+ * per-instance team recolor. Each `.glb` is baked CC0 by our own generator
+ * scripts (see `client/public/models/ATTRIBUTION.md`), so no network fetch.
  */
-const GLTF_MODELS = { human: '/models/character.glb' } as const;
+const GLTF_MODELS = {
+  human: '/models/human.glb',
+  zombie: '/models/zombie.glb',
+} as const;
 
 /** Build one body behind the {@link CharacterModel} seam per the switch above. */
 function createCharacter(id: number): CharacterModel {
