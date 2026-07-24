@@ -37,11 +37,19 @@ const DARK = 0x05070a;
 
 /** Cold blue-grey bounce fill. Kept dim so shadows stay deep, but never zero — pitch black is unplayable. */
 const AMBIENT_COLOR = 0x2a3846;
-const AMBIENT_INTENSITY = 0.45;
+// M11 (t11c): nudged 0.45 → 0.55. ACES filmic tone-mapping (main.ts) darkens the
+// low end, so the shadowed, ambient-only sides of buildings crushed toward black;
+// a small lift keeps them legibly dark-blue rather than pure void, without turning
+// the night milky (the dark AMBIENT_COLOR still holds the shadows down).
+const AMBIENT_INTENSITY = 0.55;
 
 /** The moon: a pale, cold key-light raking across the town from high up. */
 const MOON_COLOR = 0xa9c7ff;
-const MOON_INTENSITY = 1.1;
+// M11 (t11c): nudged 1.1 → 1.25. ACES rolls off the brightest values, so the
+// former 1.1 key-light lost punch on moonlit faces; +0.15 restores the raking
+// contrast while the filmic highlight roll-off keeps directly-lit faces from
+// clipping to flat white.
+const MOON_INTENSITY = 1.25;
 
 /**
  * The moon's world position — and thus the direction its cold key-light rakes
@@ -194,8 +202,14 @@ export function createAtmosphere(scene: THREE.Scene): Atmosphere {
 
   // Nudge samples off the surface to kill acne on the big flat faces/ground; the
   // small magnitudes avoid detaching shadows from their casters (peter-panning).
+  // M11 (t11c): the brighter moon above raises shadow contrast, so any acne on
+  // grazing faces reads more; normalBias 0.02 → 0.03 offsets a little further along
+  // the surface normal to suppress it — still well under one shadow texel (~68 mm
+  // at a 140 m frustum / 2048² map), so the thin lamp-post shadows do not peter-pan.
+  // `bias` is left at -0.0005: it was already clean, and depth-bias over a wide
+  // ortho frustum is the axis more prone to peter-panning if pushed.
   moon.shadow.bias = -0.0005;
-  moon.shadow.normalBias = 0.02;
+  moon.shadow.normalBias = 0.03;
 
   scene.add(moon);
   scene.add(moon.target);

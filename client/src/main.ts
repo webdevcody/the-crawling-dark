@@ -71,6 +71,18 @@ const app = document.querySelector<HTMLDivElement>('#app') ?? document.body;
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+// M11 (t11c): color-management + tone-mapping pass. Render the scene through the
+// ACES filmic curve so bright emissive sources (lamp bulbs, lit windows, the moon
+// disc) roll off gracefully toward white instead of hard-clipping, while mid-tones
+// keep their contrast. ACES darkens the image slightly versus a raw linear clamp,
+// so a modest >1 exposure keeps the night legible (never pitch black) without
+// pushing those highlights back into clipping; the ambient/moon intensities in
+// Atmosphere.ts are re-balanced against this same curve.
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.2;
+// M11 (t11c): set explicitly (the r152+ default) so the final image is sRGB-encoded
+// and our authored sRGB colors/textures read correctly end-to-end.
+renderer.outputColorSpace = THREE.SRGBColorSpace;
 // M6 (t6e): enable the moon's soft shadow map (see Atmosphere.ts).
 configureRenderer(renderer);
 // M10 (t10a): capture the GPU's max anisotropy so every tiled PBR texture the
