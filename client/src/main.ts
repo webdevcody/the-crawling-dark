@@ -52,7 +52,8 @@ import { buildTown } from './scene/TownView';
 import { buildEnvironment, disposeEnvironment } from './scene/Environment';
 import { Water } from './scene/Water';
 import { TextureLibrary, makeStandardMaterial, makeGroundDirtSet } from './scene/TextureLibrary';
-import { Character } from './entities/Character';
+import { Character, type CharacterModel } from './entities/Character';
+import { GltfCharacter } from './entities/GltfCharacter';
 import {
   configureRenderer,
   createAtmosphere,
@@ -311,13 +312,40 @@ function ensureWorld(): void {
 /* -------------------------------------------------------------------------- */
 
 /**
+ * THE single M13 (t13a) renderer switch: how entity bodies are drawn.
+ * `'procedural'` keeps the built-in articulated rig ({@link Character}) — the
+ * offline-safe default with zero asset dependency, so the bundled build renders
+ * exactly as before. `'gltf'` renders rigged models from `client/public/models/`
+ * via {@link GltfCharacter}, which itself falls back to the procedural rig
+ * per-body whenever an asset is missing. Both sides honor the {@link CharacterModel}
+ * seam, so NOTHING else in this file changes when it flips — and, because the
+ * heavy GLTFLoader is imported dynamically inside {@link GltfCharacter}, leaving
+ * this on `'procedural'` keeps it out of the main bundle.
+ */
+const CHARACTER_RENDERER: 'procedural' | 'gltf' = 'procedural';
+
+/**
+ * Model URLs used only when {@link CHARACTER_RENDERER} is `'gltf'`. One model
+ * serves both teams (distinguished by the per-instance team recolor); adding a
+ * distinct `zombie` URL makes an infection model-swap instead.
+ */
+const GLTF_MODELS = { human: '/models/character.glb' } as const;
+
+/** Build one body behind the {@link CharacterModel} seam per the switch above. */
+function createCharacter(id: number): CharacterModel {
+  return CHARACTER_RENDERER === 'gltf'
+    ? new GltfCharacter(id, GLTF_MODELS)
+    : new Character(id);
+}
+
+/**
  * Live character rigs keyed by entity id, mirroring the interpolated entity set.
  * Each {@link Character} is an articulated humanoid built behind the
  * {@link CharacterModel} seam (see `entities/Character.ts`), so the box-per-body
  * renderer this replaced — and, later, a GLTF/AnimationMixer body — can be
  * swapped in without touching the reconciliation loop below.
  */
-const characters = new Map<number, Character>();
+const characters = new Map<number, CharacterModel>();
 
 /**
  * `performance.now()` of the previous {@link syncEntities} call, used to derive a
@@ -354,7 +382,7 @@ function syncEntities(
 
     let character = characters.get(entity.id);
     if (character === undefined) {
-      character = new Character(entity.id);
+      character = createCharacter(entity.id);
       character.setTeam(entity.kind, isLocal);
       scene.add(character.root);
       characters.set(entity.id, character);
