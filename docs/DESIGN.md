@@ -347,10 +347,64 @@ data model + collision so the rest of M9 can build on one source of truth.
   `resolveCircleCircle`, inside the same relaxation loop as buildings and before
   the perimeter clamp — so a player can never walk through a tree or into open
   water.
-- **Baseline generation (refined later in M9).** t9a emits a *sparse* boundary
-  forest (two loose rings just inside the wall, at the map's mid-edges — leaving
-  the square's corners, including the NPC spawn at `half − 5`, clear), one lake
-  placed on a ring that clears the plaza and stays inside the town, and the
-  interior street grid. t9b (districts + ring road), t9c (dense perimeter
-  forest), and t9d (lake placement/rendering) densify these; t9e renders them
-  (instanced); t9f feeds trees/water into the nav grid + AI perception.
+- **Baseline generation (t9a).** t9a emitted a *sparse* boundary forest, one lake
+  on a ring that clears the plaza, and the interior street grid — the seams the
+  rest of M9 builds on.
+
+### World generation — districts, forest, roads, lake (t9b–t9d)
+
+The shared generator now produces a town that reads as a place, still purely from
+the seed and still byte-for-byte identical on client and server:
+
+- **Districts (t9b).** Building footprint + height are graded by a block's
+  Chebyshev distance from the core: a **tower core** (16–44 m) rings the plaza and
+  **small houses** (3.5–8 m, smaller footprints) sit on the outskirts. The
+  per-cell PRNG draw order is unchanged, so the placement stream stays aligned;
+  only the height/footprint mapping changed. `footScale ≤ 1`, so the street-
+  clearance and non-overlap invariants still hold.
+- **Ring road (t9b).** `generateRoads` adds a closed loop at ±`TOWN_HALF` that
+  ties the interior lanes together and fronts the forest (still non-colliding).
+- **Dense perimeter forest (t9c).** `generateTrees` now packs a thick band of
+  solid trees in the square annulus just outside the ring road out to the wall
+  clamp (grid-stepped with per-tree jitter; ~740 trees/seed). At this spacing +
+  trunk radius the band is walk-through-proof — a body marched at any edge/corner
+  is stopped by trees before the wall clamp — so the edge reads as forest, not a
+  slab (the clamp survives as an invisible backstop). The **NPC spawn corner**
+  (`half − 5`) is left an open clearing so patient-zero never wakes wedged in the
+  trees. Verified by `scripts/verify-world.mjs`.
+- **Lake (t9d).** Radius widened to 8–12 m on a 28–38 m ring; still clears the
+  plaza (ring − radius ≥ 16 > 12), stays inside the town, never reaches the forest
+  band, and the road grid routes around it.
+
+### Client rendering — instanced environment + lake (t9d/t9e)
+
+- **Instanced forest (t9e).** `client/src/scene/Environment.ts` draws the whole
+  ~740-tree forest as **two** `InstancedMesh`es (one trunk cylinder, one foliage
+  cone), the road grid as **one** merged flat ribbon geometry, and rocks/bushes as
+  **two** more instanced meshes — so the entire natural world is ~5 extra draw
+  calls regardless of density. Scatter placement is deterministic from `world.seed`
+  (a local `mulberry32` copy, never `Math.random`) and rejection-sampled clear of
+  the plaza, buildings, lake, and roads.
+- **Bare walls dropped (t9c).** `TownView.buildTown` no longer renders the four
+  perimeter wall slabs — the forest now walls the edge. Collision is unchanged
+  (the wall is a shared clamp, never a mesh).
+- **Lake surface (t9d).** `client/src/scene/Water.ts` renders `world.water` as one
+  dark, semi-metallic disc whose ripples come from a seamlessly-tiling procedural
+  normal map scrolled each frame (a couple of scalar writes, zero per-frame
+  allocations). Wired into `main.ts` beside `buildTown`/`addStreetLights`, animated
+  in the render loop, and disposed on teardown.
+
+### Server AI — trees + lake perception (t9f)
+
+- **Nav grid.** `NavGrid` now also blocks cells within `NAV_CLEARANCE` of any tree
+  and (when water is `blocked`) the lake, via a *scatter* pass — each disc marks
+  only the cells inside its own footprint — so the natural obstacles cost a handful
+  of cells apiece rather than an O(cells) rescan. A* routes around forest + water.
+- **Steering.** The avoidance probe clearance is now `MIN(building, nearest tree,
+  lake)` per candidate heading (a server-local ray-vs-circle inflated by the body
+  radius, bound-culled), so the NPC steers around trunks and the shoreline.
+- **Line of sight.** A server-local `hasSight` = shared building LoS **AND** no
+  tree straddles the segment. Trees occlude sight; the **lake does not** (open
+  water is see-through). Used at both perception sites (`isVisible` + the `follow`
+  clear-line check). The forest is a perimeter annulus with an NPC-spawn clearing,
+  so it never fragments the open interior — no new A* wedging.

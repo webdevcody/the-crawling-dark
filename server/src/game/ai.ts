@@ -149,6 +149,46 @@ export function yawFromDir(dx: number, dz: number): number {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Ray / segment vs circle (server-local — trees + lake perception, t9f)      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Ray-vs-circle on the XZ plane: cast from `(ox, oz)` along the UNIT direction
+ * `(dx, dz)` and return the distance to the first intersection with the disc
+ * centred at `(cx, cz)` of radius `r`, or `null` when the ray misses (or the disc
+ * lies wholly behind the origin). This mirrors the shared {@link rayAABB}
+ * contract for the new circular obstacles: the disc is the tree/lake collider
+ * (already inflated by the body radius for avoidance, or bare for a sightline),
+ * and an origin already inside it reports distance `0`.
+ *
+ * Solves the quadratic |o + t·d − c|² = r² with `d` unit (so the `t²` coefficient
+ * is 1): with `f = o − c`, `b = f·d`, `c₀ = f·f − r²`, the nearer root is
+ * `−b − √(b² − c₀)`. `c₀ ≤ 0` means the origin sits inside the disc; `b > 0` means
+ * the centre is behind the ray, so any hit would be at negative `t` — both are
+ * short-circuited before the `sqrt`.
+ */
+function rayCircle(
+  ox: number,
+  oz: number,
+  dx: number,
+  dz: number,
+  cx: number,
+  cz: number,
+  r: number,
+): number | null {
+  const fx = ox - cx;
+  const fz = oz - cz;
+  const c0 = fx * fx + fz * fz - r * r;
+  if (c0 <= 0) return 0; // origin already inside the disc → contact at distance 0
+  const b = fx * dx + fz * dz; // f·d (the direction is unit, so a == 1)
+  if (b > 0) return null; // disc centre is behind the ray — no forward hit
+  const disc = b * b - c0;
+  if (disc < 0) return null; // ray passes wide of the disc
+  const t = -b - Math.sqrt(disc);
+  return t >= 0 ? t : null;
+}
+
+/* -------------------------------------------------------------------------- */
 /* ZombieAI                                                                   */
 /* -------------------------------------------------------------------------- */
 
@@ -304,10 +344,11 @@ export class ZombieAI {
    * within its own detection radius AND no building occludes the sightline.
    *
    * The radius shrinks for a crawling human ({@link AI_CRAWL_DETECTION_MULT}),
-   * which — together with the {@link hasLineOfSight} occlusion check — is what
-   * makes the acceptance criterion hold: a crawler behind cover is spotted far
-   * less readily than someone running upright in the open, because it must be
-   * both much closer (smaller radius) and in an unbroken line of sight.
+   * which — together with the {@link hasSight} occlusion check — is what makes
+   * the acceptance criterion hold: a crawler behind cover is spotted far less
+   * readily than someone running upright in the open, because it must be both
+   * much closer (smaller radius) and in an unbroken line of sight past buildings
+   * AND trees.
    */
   private isVisible(npc: Player, human: Player): boolean {
     const radius =
@@ -317,13 +358,7 @@ export class ZombieAI {
     const dx = human.move.x - npc.move.x;
     const dz = human.move.z - npc.move.z;
     if (dx * dx + dz * dz > radius * radius) return false;
-    return hasLineOfSight(
-      this.world,
-      npc.move.x,
-      npc.move.z,
-      human.move.x,
-      human.move.z,
-    );
+    return this.hasSight(npc.move.x, npc.move.z, human.move.x, human.move.z);
   }
 
   /* ---------------------------------------------------------------------- */
@@ -332,12 +367,16 @@ export class ZombieAI {
 
   /**
    * Pick the best heading toward world direction `(dx, dz)` that keeps clear of
-   * buildings. We fan {@link STEER_OFFSETS} candidate headings around the direct
-   * line, cast an avoidance ray (inflated by the body radius) along each to
+   * every obstacle. We fan {@link STEER_OFFSETS} candidate headings around the
+   * direct line, cast an avoidance ray (inflated by the body radius) along each to
    * measure how far it is open, and choose the heading that maximises clearance
-   * minus a {@link TURN_PENALTY} on deviation — i.e. go as straight at the prey
-   * as the walls allow. Falls back to the raw heading if the target is
-   * effectively on top of us.
+   * minus a {@link TURN_PENALTY} on deviation — i.e. go as straight at the prey as
+   * the world allows. Falls back to the raw heading if the target is effectively
+   * on top of us.
+   *
+   * Per-heading clearance is the nearest hit of ALL obstacle kinds: buildings
+   * (shared AABB cast) narrowed by trees and the lake ({@link raycastNature}), so
+   * the NPC steers around trunks and water exactly as it does around walls.
    */
   private steer(npc: Player, dx: number, dz: number): number {
     const len = Math.hypot(dx, dz);
@@ -350,7 +389,9 @@ export class ZombieAI {
     for (const off of STEER_OFFSETS) {
       const yaw = baseYaw + off;
       const f = forwardFromYaw(yaw);
-      const clear = raycastBuildings(
+      // Building clearance first (capped at the ray length), then let trees + the
+      // lake only pull it shorter, so `clear` is MIN(building, nearest tree, lake).
+      const buildingClear = raycastBuildings(
         this.world,
         npc.move.x,
         npc.move.z,
@@ -359,6 +400,7 @@ export class ZombieAI {
         AI_AVOID_RAY_LENGTH,
         PLAYER_RADIUS,
       );
+      const clear = this.raycastNature(npc.move.x, npc.move.z, f.x, f.z, buildingClear);
       const score = clear - Math.abs(off) * TURN_PENALTY;
       if (score > bestScore) {
         bestScore = score;
@@ -366,6 +408,82 @@ export class ZombieAI {
       }
     }
     return bestYaw;
+  }
+
+  /**
+   * Distance along the ray from `(ox, oz)` in UNIT direction `(dx, dz)` at which
+   * it first strikes a tree trunk or the (blocked) lake shoreline, or `maxDist`
+   * when it reaches that far clear of both. Passing the building hit distance in
+   * as `maxDist` makes this the min-clearance combiner for {@link steer}: it only
+   * ever returns something shorter. Each disc is inflated by {@link PLAYER_RADIUS}
+   * to match the building `pad`, so the NPC keeps a body width off trunks/water.
+   *
+   * Only one NPC runs this, so a per-heading pass over ~740 trees is affordable —
+   * but each tree is bound-culled first: if its centre is farther than the current
+   * `nearest` clearance plus its inflated radius, no point on it can be struck
+   * within the ray, so it is skipped before the quadratic. `nearest` shrinks as
+   * closer hits are found, tightening the cull as the scan proceeds.
+   */
+  private raycastNature(
+    ox: number,
+    oz: number,
+    dx: number,
+    dz: number,
+    maxDist: number,
+  ): number {
+    let nearest = maxDist;
+    const trees = this.world.trees;
+    for (let i = 0; i < trees.length; i++) {
+      const t = trees[i];
+      const inflated = t.radius + PLAYER_RADIUS;
+      const gx = t.x - ox;
+      const gz = t.z - oz;
+      const cull = nearest + inflated;
+      if (gx * gx + gz * gz > cull * cull) continue; // cannot be hit within `nearest`
+      const hit = rayCircle(ox, oz, dx, dz, t.x, t.z, inflated);
+      if (hit !== null && hit < nearest) nearest = hit;
+    }
+    const w = this.world.water;
+    if (w !== null && this.world.waterMode === 'blocked') {
+      const hit = rayCircle(ox, oz, dx, dz, w.cx, w.cz, w.radius + PLAYER_RADIUS);
+      if (hit !== null && hit < nearest) nearest = hit;
+    }
+    return nearest;
+  }
+
+  /**
+   * Line of sight for perception (t9f): the segment from `(x0, z0)` to `(x1, z1)`
+   * is clear only when the shared {@link hasLineOfSight} finds no BUILDING across
+   * it AND no tree trunk straddles it. Trees occlude; the lake deliberately does
+   * NOT — open water is see-through, so a human across the shoreline can still be
+   * spotted, and the lake is never tested here.
+   *
+   * Trees are cast bare (no body pad — a sightline is a ray, not the NPC's
+   * cylinder) and bound-culled by the segment length before the segment-vs-circle
+   * test. A trunk counts as occluding only when it is struck strictly before the
+   * far endpoint (matching the shared LoS epsilon), so a human standing right at a
+   * trunk's edge is still just visible.
+   */
+  private hasSight(x0: number, z0: number, x1: number, z1: number): boolean {
+    // Buildings first (shared cast) — the cheap, common blocker.
+    if (!hasLineOfSight(this.world, x0, z0, x1, z1)) return false;
+    const dx = x1 - x0;
+    const dz = z1 - z0;
+    const dist = Math.hypot(dx, dz);
+    if (dist < 1e-6) return true;
+    const ux = dx / dist;
+    const uz = dz / dist;
+    const trees = this.world.trees;
+    for (let i = 0; i < trees.length; i++) {
+      const t = trees[i];
+      const gx = t.x - x0;
+      const gz = t.z - z0;
+      const cull = dist + t.radius;
+      if (gx * gx + gz * gz > cull * cull) continue; // too far from the origin to cross
+      const hit = rayCircle(x0, z0, ux, uz, t.x, t.z, t.radius);
+      if (hit !== null && hit < dist - 1e-4) return false; // trunk between the points
+    }
+    return true; // no building and no tree occludes the sightline
   }
 
   /* ---------------------------------------------------------------------- */
@@ -425,11 +543,11 @@ export class ZombieAI {
     state: AiState,
     dtMs: number,
   ): number | null {
-    // A clear straight line to the prey means the obstacle is behind us: hand
-    // control back to reactive steering, which is smoother than grid hops.
-    if (
-      hasLineOfSight(this.world, npc.move.x, npc.move.z, target.move.x, target.move.z)
-    ) {
+    // A clear straight line to the prey (no building AND no tree between) means the
+    // obstacle is behind us: hand control back to reactive steering, which is
+    // smoother than grid hops. The lake never blocks sight, so a route around the
+    // shoreline is held by the stall/A* machinery, not dropped here.
+    if (this.hasSight(npc.move.x, npc.move.z, target.move.x, target.move.z)) {
       this.abandonPath(state);
       return null;
     }
