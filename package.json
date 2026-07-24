@@ -1,0 +1,21 @@
+{
+  "name": "the-crawling-dark",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The Crawling Dark — a multiplayer Three.js survival game with an authoritative ws server.",
+  "type": "module",
+  "packageManager": "pnpm@9.15.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "pnpm --parallel --filter=@crawling-dark/client --filter=@crawling-dark/server dev",
+    "dev:client": "pnpm --filter=@crawling-dark/client dev",
+    "dev:server": "pnpm --filter=@crawling-dark/server dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}
