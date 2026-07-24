@@ -1,11 +1,16 @@
 /**
  * The Crawling Dark — procedural audio engine (M6 · t6d).
  *
- * This sandbox ships with **no audio assets** and has no reliable runtime fetch,
- * so every sound here is **synthesized on the fly with the Web Audio API** —
- * oscillators, filtered noise (an {@link AudioBuffer} of random samples), gain
- * envelopes, and stereo panning. Nothing is loaded from disk or the network, so
- * the whole pass builds and runs offline.
+ * Historically this game shipped **no audio assets**, so every sound here is
+ * **synthesized on the fly with the Web Audio API** — oscillators, filtered
+ * noise (an {@link AudioBuffer} of random samples), gain envelopes, and stereo
+ * panning — and the whole pass builds and runs offline.
+ *
+ * M12 · t12a adds a **sample path** on top of that synth core: an
+ * {@link AssetLibrary} fetches + decodes real one-shot files, and every one-shot
+ * ({@link swing}, {@link hit}, {@link infect}, {@link footstep}) plays its
+ * recorded buffer when present, **falling back to the synth voice** when the
+ * file is missing (offline build, 404, or removed) — see {@link playBuffer}
  *
  * The engine owns a single {@link AudioContext} built lazily on the first user
  * gesture (browsers refuse to start audio before one), and a tiny mixing graph:
@@ -31,6 +36,8 @@
  * the sound methods no-op rather than throw, and {@link setListener} simply
  * records the latest position for the next audible event.
  */
+
+import { AssetLibrary, type AudioManifest } from './AssetLibrary';
 
 /* -------------------------------------------------------------------------- */
 /* Types + tunables                                                           */
@@ -87,6 +94,29 @@ function clamp(x: number, lo: number, hi: number): number {
   return x < lo ? lo : x > hi ? hi : x;
 }
 
+/**
+ * Built-in sample set (M12 · t12a). Logical name -> file under `client/public/`
+ * (served at the app root by Vite). Anything here that fails to load — or is
+ * removed from the build — transparently falls back to the synth voice, so the
+ * game still makes sound offline. Later tasks add more via
+ * {@link AudioEngine.loadSamples}.
+ */
+const SAMPLE_MANIFEST: AudioManifest = {
+  swing: 'audio/sfx/swing.wav',
+  hit: 'audio/sfx/impact.wav',
+  footstep: 'audio/sfx/footstep.wav',
+};
+
+/** Optional shaping for {@link AudioEngine.playBuffer}. */
+export interface SampleOptions {
+  /** Linear level multiplier applied before the spatializer (default 1). */
+  gain?: number;
+  /** Playback-rate multiplier — repitches + retimes the sample (default 1). */
+  rate?: number;
+  /** Start offset into the buffer in seconds (default 0). */
+  offset?: number;
+}
+
 /* -------------------------------------------------------------------------- */
 /* AudioEngine                                                                */
 /* -------------------------------------------------------------------------- */
@@ -126,6 +156,11 @@ export class AudioEngine {
   /** The listener's look yaw (radians), so panning tracks the camera facing. */
   private listenerYaw = 0;
 
+  /** Sample library (real assets); consulted per one-shot for sample-vs-synth. */
+  private readonly library = new AssetLibrary();
+  /** Accumulated manifest to (re)load whenever the context comes up (t12a). */
+  private pendingManifest: Record<string, string> = { ...SAMPLE_MANIFEST };
+
   /* ---- Lifecycle -------------------------------------------------------- */
 
   /**
@@ -162,6 +197,10 @@ export class AudioEngine {
     this.sfxGain = sfx;
     this.ambientGain = ambient;
     this.noiseBuffer = this.makeNoise(ctx, 1.5);
+
+    // Kick off sample loading (t12a). Async + fire-and-forget: one-shots synth-
+    // fall-back until buffers arrive, and any file that 404s stays on the synth.
+    void this.library.load(ctx, this.pendingManifest);
 
     this.applyGains(0); // snap the bus gains to the stored volumes/mute state.
   }
@@ -322,6 +361,59 @@ export class AudioEngine {
     }
   }
 
+  /* ---- Sample playback (real assets, synth fallback) -------------------- */
+
+  /** The loaded sample library; consult `has(name)` to branch sample-vs-synth. */
+  get assets(): AssetLibrary {
+    return this.library;
+  }
+
+  /**
+   * Register + (if the context is live) begin loading additional samples beyond
+   * the built-in {@link SAMPLE_MANIFEST}. Later audio tasks (expanded SFX, music,
+   * environment one-shots) call this to drop their own files in without touching
+   * the loader. Safe before the context exists — the manifest is remembered and
+   * loaded on the next {@link resume}.
+   */
+  loadSamples(manifest: AudioManifest): void {
+    this.pendingManifest = { ...this.pendingManifest, ...manifest };
+    if (this.ctx !== null) void this.library.load(this.ctx, manifest);
+  }
+
+  /**
+   * Play a loaded sample positionally through the shared {@link oneShot}
+   * spatializer (panner + distance gain + SFX bus). Returns `true` when a buffer
+   * for `name` exists (and was routed — distance culling still applies), or
+   * `false` when the sample is absent, so callers can synth-fall-back:
+   *
+   * ```ts
+   * if (!this.playBuffer('swing', pos)) this.oneShot(pos, synthSwing);
+   * ```
+   *
+   * `opts.rate` repitches, `opts.gain` scales level, `opts.offset` starts partway
+   * into the buffer (for grain variety on reused one-shots).
+   */
+  playBuffer(name: string, pos: Point3, opts: SampleOptions = {}): boolean {
+    const buf = this.library.get(name);
+    if (buf === undefined) return false;
+    const { gain = 1, rate = 1, offset = 0 } = opts;
+    this.oneShot(pos, (ctx, t0, dest) => {
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.playbackRate.value = rate;
+      if (gain === 1) {
+        src.connect(dest);
+      } else {
+        const g = ctx.createGain();
+        g.gain.value = gain;
+        src.connect(g).connect(dest);
+      }
+      src.start(t0, offset);
+      return [src];
+    });
+    return true;
+  }
+
   /* ---- One-shot SFX ----------------------------------------------------- */
 
   /**
@@ -329,6 +421,8 @@ export class AudioEngine {
    * then falls, shaped by a quick attack + tail. Positioned at the swinger.
    */
   swing(pos: Point3): void {
+    // Real sample if present (t12a); otherwise the synth whoosh below.
+    if (this.playBuffer('swing', pos, { rate: 0.97 + Math.random() * 0.06 })) return;
     this.oneShot(pos, (ctx, t0, dest) => {
       const src = ctx.createBufferSource();
       src.buffer = this.noiseBuffer;
@@ -355,6 +449,8 @@ export class AudioEngine {
    * layered with a bright noise transient click. Positioned at the victim.
    */
   hit(pos: Point3): void {
+    // Real sample if present (t12a); otherwise the synth thock below.
+    if (this.playBuffer('hit', pos, { rate: 0.97 + Math.random() * 0.06 })) return;
     this.oneShot(pos, (ctx, t0, dest) => {
       // Body: a low sine that snaps from 190 Hz down to 55 Hz.
       const body = ctx.createOscillator();
@@ -388,6 +484,8 @@ export class AudioEngine {
    * deliberately the biggest, most unsettling one-shot. Positioned at the victim.
    */
   infect(pos: Point3): void {
+    // Real sample if present (t12a); otherwise the synth stinger below.
+    if (this.playBuffer('infect', pos)) return;
     this.oneShot(pos, (ctx, t0, dest) => {
       // Sub-bass that bends downward — the "sinking" feeling of turning.
       const sub = ctx.createOscillator();
@@ -445,6 +543,10 @@ export class AudioEngine {
    */
   footstep(pos: Point3, kind: FootstepKind): void {
     const p = FOOTSTEP[kind];
+    // Real sample if present (t12a): reuse the per-kind rate + relative level;
+    // otherwise fall through to the synthesized thud below.
+    const rate = p.rate * (0.94 + Math.random() * 0.12);
+    if (this.playBuffer('footstep', pos, { rate, gain: p.peak / 0.85 })) return;
     this.oneShot(pos, (ctx, t0, dest) => {
       const src = ctx.createBufferSource();
       src.buffer = this.noiseBuffer;
