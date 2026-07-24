@@ -139,8 +139,12 @@ PONG       { id }
 ### 4. World & collision
 
 - **Town** = a bounded grid of building AABBs (boxes) around streets and a central square, with a perimeter wall so no one runs off the map. Built from a seed so client and server agree.
-- **2.5D collision** (big simplification): players are cylinders on a flat ground plane; collision is resolved as circle-vs-AABB on the **XZ plane**, with `Y` handled separately for jump gravity. This avoids a full 3D physics engine while still feeling solid.
-- MVP uses box meshes for buildings; swap in GLTF town assets later without touching collision (collision reads the same AABB list).
+- **Natural/urban features (M9 · t9a).** The same seed also produces solid **trees** (circular XZ colliders), one **lake** (a circular water region), and a decorative **road** grid. These live on the `World` beside `buildings`/`colliders` and, like everything else, are byte-for-byte identical on client and server (generated from an independent `seed ^ 0x9e3779b9` PRNG stream, so the earlier per-seed building layout is unchanged).
+- **2.5D collision** (big simplification): players are cylinders on a flat ground plane; collision is resolved on the **XZ plane** as **circle-vs-AABB** for buildings and **circle-vs-circle** for trees (and the lake shoreline), with `Y` handled separately for jump gravity. This avoids a full 3D physics engine while still feeling solid.
+- **Water rule = `blocked`** (`World.waterMode`): the lake is a solid shoreline you cannot cross, resolved in `collideCircleXZ` exactly like a tree. (`'slow'` deep water is left as a future seam handled in the sim, not in collision.)
+- Roads are **non-colliding** — render/layout data only (drawn in t9e, refined in t9b) — and are intentionally not added to `colliders`.
+- Trees and the lake are kept OUT of the AABB `colliders` list, so the nav grid and AI ray casts (`raycastBuildings`/`hasLineOfSight`) stay building-only until M9 · t9f wires the new obstacles into AI perception.
+- MVP uses box meshes for buildings; swap in GLTF town assets later without touching collision (collision reads the same collider lists).
 
 ---
 
@@ -319,3 +323,34 @@ comfortably holds the M7 bandwidth targets; **30 Hz is the one integral step up*
 a future change ever needs it. Because `INTERP_DELAY_MIN_MS` is expressed relative to
 `SNAPSHOT_MS`, the t8d interpolation band keeps straddling snapshots automatically at
 either rate.
+
+
+## M9 notes (Phase 2 — World & Environment)
+
+Milestone **M9** grows the flat building grid into a believable place: trees, a
+lake, and roads. Task **t9a** (this section's prerequisite) lands only the shared
+data model + collision so the rest of M9 can build on one source of truth.
+
+### Shared World model & collision (t9a)
+
+- **New `World` fields:** `trees: Tree[]` (circular colliders — `x`, `z`,
+  `radius`, `height`), `water: Lake | null` (a circular `cx`/`cz`/`radius`
+  region), `waterMode: WaterMode` (`'blocked'` for M9), and `roads: Road[]`
+  (non-colliding polylines with a `width`).
+- **Determinism.** Features are drawn from a second, seed-derived PRNG
+  (`seed ^ 0x9e3779b9`) so the existing building layout for any seed is
+  untouched; the only building change is that any box now sitting under the lake
+  is dropped. Same seed ⇒ identical `trees`/`water`/`roads` on every client and
+  the server (verified across seeds).
+- **Collision.** `collideCircleXZ` now also pushes the body out of every tree and
+  (because `waterMode === 'blocked'`) out of the lake shoreline via
+  `resolveCircleCircle`, inside the same relaxation loop as buildings and before
+  the perimeter clamp — so a player can never walk through a tree or into open
+  water.
+- **Baseline generation (refined later in M9).** t9a emits a *sparse* boundary
+  forest (two loose rings just inside the wall, at the map's mid-edges — leaving
+  the square's corners, including the NPC spawn at `half − 5`, clear), one lake
+  placed on a ring that clears the plaza and stays inside the town, and the
+  interior street grid. t9b (districts + ring road), t9c (dense perimeter
+  forest), and t9d (lake placement/rendering) densify these; t9e renders them
+  (instanced); t9f feeds trees/water into the nav grid + AI perception.
