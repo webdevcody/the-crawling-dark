@@ -32,9 +32,6 @@
 import * as THREE from 'three';
 import {
   MAP_SIZE,
-  PLAYER_RADIUS,
-  PLAYER_HEIGHT,
-  CRAWL_HEIGHT,
   generateWorld,
   type World,
   type EntityKind,
@@ -43,6 +40,7 @@ import { Connection } from './net/Connection';
 import { Controls } from './input/Controls';
 import { FollowCamera } from './scene/FollowCamera';
 import { buildTown } from './scene/TownView';
+import { Character } from './entities/Character';
 import { HUD } from './ui/HUD';
 import type { InterpolatedEntity } from './net/Interpolation';
 
@@ -185,193 +183,34 @@ function ensureWorld(): void {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Entity meshes — reconciled against interpolated snapshots each frame        */
+/* Entity characters — reconciled against interpolated snapshots each frame     */
 /* -------------------------------------------------------------------------- */
 
-/** Unit-height player box (footprint = collision diameter); scaled per-frame by profile. */
-const PLAYER_GEOMETRY = new THREE.BoxGeometry(
-  PLAYER_RADIUS * 2,
-  1,
-  PLAYER_RADIUS * 2,
-);
-
-/** Highlight color for the local player (human) so you can tell which body is you. */
-const LOCAL_COLOR = new THREE.Color(0x53ffa8);
-
 /**
- * The LOCAL player's zombie tint — a toxic, self-lit green. Combined with the
- * strong emissive glow every local body carries, it keeps "you" unmistakable
- * even after turning, while still visibly reading as the zombie team.
+ * Live character rigs keyed by entity id, mirroring the interpolated entity set.
+ * Each {@link Character} is an articulated humanoid built behind the
+ * {@link CharacterModel} seam (see `entities/Character.ts`), so the box-per-body
+ * renderer this replaced — and, later, a GLTF/AnimationMixer body — can be
+ * swapped in without touching the reconciliation loop below.
  */
-const LOCAL_ZOMBIE_COLOR = new THREE.Color(0x9dff2f);
-
-/** Electric-yellow tint layered onto a body's emissive while it is stunned. */
-const STUN_TINT = new THREE.Color(0xffe14a);
-
-/** How far a downed body's color is dimmed toward black in the death-cam. */
-const DOWN_DIM = 0.32;
-
-/** Live meshes keyed by entity id, mirroring the interpolated entity set. */
-const meshes = new Map<number, THREE.Mesh>();
-
-/** Deterministic, well-spread color from an entity id (golden-ratio hue). */
-function colorForId(id: number): THREE.Color {
-  const hue = (id * 0.61803398875) % 1;
-  return new THREE.Color().setHSL(hue, 0.6, 0.55);
-}
+const characters = new Map<number, Character>();
 
 /**
- * Desaturated, sickly green/olive for a zombie body. A slight per-id hue jitter
- * keeps a horde from reading as one flat blob while staying firmly in the
- * "infected" palette so zombies never look like the bright human colors.
+ * `performance.now()` of the previous {@link syncEntities} call, used to derive a
+ * per-frame delta for the rigs (the procedural animation is time-based off
+ * `nowMs` and ignores it, but the seam passes it through for a future
+ * `AnimationMixer.update`). Kept here so {@link syncEntities} can preserve its
+ * exact `(entities, nowMs)` signature — no dt parameter is added to it.
  */
-function zombieColorForId(id: number): THREE.Color {
-  const hue = 0.26 + ((id * 0.61803398875) % 1) * 0.06; // narrow green/olive band
-  return new THREE.Color().setHSL(hue, 0.32, 0.3);
-}
+let lastCharNowMs = 0;
 
 /**
- * Paint an entity's material for its TEAM and cache the resulting "base" colors
- * on the mesh (`userData.baseColor` / `userData.baseEmissive`), so the per-frame
- * state overlay in {@link applyEntityState} can always start from a clean team
- * look. Called on spawn and again whenever an entity's `kind` flips (a human
- * turning into a zombie — same id), which is what makes an infection visibly
- * recolor the body mid-round.
- *
- * The LOCAL player is kept self-lit (a strong emissive glow) so you can always
- * pick yourself out of a crowd; its base hue still tracks your team (spring
- * green as a human -> toxic green as a zombie) so your own turn is visible too.
- */
-function applyTeamMaterial(
-  mesh: THREE.Mesh,
-  isLocal: boolean,
-  kind: EntityKind,
-): void {
-  const material = mesh.material as THREE.MeshStandardMaterial;
-  const base = mesh.userData.baseColor as THREE.Color;
-  const baseEmissive = mesh.userData.baseEmissive as THREE.Color;
-  const id = mesh.userData.entityId as number;
-
-  if (isLocal) {
-    base.copy(kind === 'zombie' ? LOCAL_ZOMBIE_COLOR : LOCAL_COLOR);
-    // Strong self-glow marks "you" regardless of team.
-    baseEmissive.copy(base).multiplyScalar(0.3);
-  } else if (kind === 'zombie') {
-    base.copy(zombieColorForId(id));
-    // Faint sickly glow so zombies read as "infected" even in shadow.
-    baseEmissive.setHex(0x142808);
-  } else {
-    base.copy(colorForId(id));
-    baseEmissive.setHex(0x000000);
-  }
-
-  material.color.copy(base);
-  material.emissive.copy(baseEmissive);
-  mesh.userData.kind = kind;
-}
-
-/** Create (once) the mesh for an entity, paint it for its team, and add it. */
-function createMesh(id: number, isLocal: boolean, kind: EntityKind): THREE.Mesh {
-  const material = new THREE.MeshStandardMaterial({
-    roughness: 0.5,
-    metalness: 0.1,
-  });
-  const mesh = new THREE.Mesh(PLAYER_GEOMETRY, material);
-  mesh.castShadow = true;
-  // Cache identity + reusable base-color scratch so we never re-allocate Colors
-  // per frame; the team paint fills them in below.
-  mesh.userData.entityId = id;
-  mesh.userData.baseColor = new THREE.Color();
-  mesh.userData.baseEmissive = new THREE.Color();
-  applyTeamMaterial(mesh, isLocal, kind);
-  scene.add(mesh);
-  meshes.set(id, mesh);
-  return mesh;
-}
-
-/**
- * Apply one frame of an entity's transform + material for its movement/combat
- * `state`. Every value is *assigned* (never accumulated) from the cached team
- * base, so a state ending automatically restores the body next frame:
- *
- *   - `crawl` -> low profile;  `down` -> a dim, flattened pancake on the ground
- *     (the death-cam pose);
- *   - `attack` -> a quick forward lunge + emissive pop that sells the swing
- *     (paired with the arc VFX spawned from the matching event);
- *   - `stun` -> jitter-in-place, a little wobble, and an electric-yellow tint.
- *
- * `nowMs` (a {@link performance.now} reading) drives the time-based stun shake.
- */
-function applyEntityState(
-  mesh: THREE.Mesh,
-  entity: InterpolatedEntity,
-  nowMs: number,
-): void {
-  const material = mesh.material as THREE.MeshStandardMaterial;
-  const base = mesh.userData.baseColor as THREE.Color;
-  const baseEmissive = mesh.userData.baseEmissive as THREE.Color;
-
-  // Start from the clean team look; overlays below tint on top of it.
-  material.color.copy(base);
-  material.emissive.copy(baseEmissive);
-
-  // Body profile + pose scratch, defaulted to a standing (or crawling) box.
-  let sx = 1;
-  let sy = entity.state === 'crawl' ? CRAWL_HEIGHT : PLAYER_HEIGHT;
-  let sz = 1;
-  let rotX = 0;
-  let rotZ = 0;
-  let dx = 0;
-  let dz = 0;
-  let yaw = entity.yaw;
-
-  switch (entity.state) {
-    case 'attack': {
-      // Lunge forward and thrust the box out along its facing.
-      rotX = -0.35;
-      sz = 1.25;
-      material.emissive.copy(base).multiplyScalar(0.45);
-      break;
-    }
-    case 'stun': {
-      // Rattled: a time-driven shake + wobble, tinted electric yellow.
-      const t = nowMs * 0.03;
-      dx = Math.sin(t) * 0.08;
-      dz = Math.cos(t * 1.3) * 0.08;
-      yaw += Math.sin(t * 0.7) * 0.25;
-      rotZ = Math.sin(t * 1.1) * 0.12;
-      material.emissive.copy(baseEmissive).lerp(STUN_TINT, 0.75);
-      break;
-    }
-    case 'down': {
-      // Death-cam: a dim pancake resting on the ground.
-      sx = 1.35;
-      sy = 0.2;
-      sz = 1.35;
-      material.color.copy(base).multiplyScalar(DOWN_DIM);
-      material.emissive.setHex(0x000000);
-      break;
-    }
-    default:
-      break;
-  }
-
-  mesh.scale.set(sx, sy, sz);
-  // `entity.y` is feet height (0 on the ground, >0 mid-jump); the box is
-  // centered, so lift it by half its scaled height to rest the base there.
-  // The stun shake nudges x/z only, never the resting height.
-  mesh.position.set(entity.x + dx, entity.y + sy / 2, entity.z + dz);
-  // rotation.order stays the default 'XYZ'; yaw is the dominant term.
-  mesh.rotation.set(rotX, yaw, rotZ);
-}
-
-/**
- * Reconcile Three.js meshes with the interpolated entity set: spawn new bodies,
- * repaint any whose team (`kind`) flipped this frame, drive their combat pose
- * via {@link applyEntityState}, and dispose meshes for entities that have left.
+ * Reconcile character rigs with the interpolated entity set: spawn new bodies,
+ * recolor any whose team (`kind`) flipped this frame, drive their movement/combat
+ * pose via {@link Character.update}, and dispose rigs for entities that have left.
  * Returns the local player's feet position for the follow camera, or `null` if
  * the local entity isn't present. `nowMs` (a {@link performance.now} reading)
- * feeds the stun animation.
+ * drives the time-based animation.
  */
 function syncEntities(
   entities: Map<number, InterpolatedEntity>,
@@ -380,30 +219,41 @@ function syncEntities(
   const localId = connection.playerId;
   let localFeet: { x: number; y: number; z: number } | null = null;
 
+  // Frame delta for the rigs, clamped so a stalled tab can't fling the pose.
+  const dtMs = lastCharNowMs === 0 ? 0 : Math.min(100, Math.max(0, nowMs - lastCharNowMs));
+  lastCharNowMs = nowMs;
+
   for (const entity of entities.values()) {
     const isLocal = entity.id === localId;
-    const mesh =
-      meshes.get(entity.id) ?? createMesh(entity.id, isLocal, entity.kind);
 
-    // A human turning into a zombie keeps its id but changes `kind`; repaint the
-    // body (and its cached base colors) the instant that flip is observed so the
-    // infection is visible.
-    if (mesh.userData.kind !== entity.kind) {
-      applyTeamMaterial(mesh, isLocal, entity.kind);
+    let character = characters.get(entity.id);
+    if (character === undefined) {
+      character = new Character(entity.id);
+      character.setTeam(entity.kind, isLocal);
+      scene.add(character.root);
+      characters.set(entity.id, character);
+    } else if (character.kind !== entity.kind) {
+      // A human turning into a zombie keeps its id but changes `kind`; recolor
+      // (and reshape) the body the instant that flip is observed so the
+      // infection is visible.
+      character.setTeam(entity.kind, isLocal);
     }
 
-    applyEntityState(mesh, entity, nowMs);
+    // `root` origin is at the feet, so the entity's `{x, y, z}` (feet height,
+    // >0 mid-jump) places the body directly; facing + pose are applied inside.
+    character.root.position.set(entity.x, entity.y, entity.z);
+    character.update(entity.state, entity.yaw, nowMs, dtMs);
 
     if (isLocal) localFeet = { x: entity.x, y: entity.y, z: entity.z };
   }
 
-  // Remove departed entities. Only the per-entity MATERIAL is disposed — the
-  // shared PLAYER_GEOMETRY is reused by every body and must never be disposed.
-  for (const [id, mesh] of meshes) {
+  // Remove departed entities, disposing each rig's owned material. The shared
+  // limb geometries live in `Character.ts` and are never disposed here.
+  for (const [id, character] of characters) {
     if (!entities.has(id)) {
-      scene.remove(mesh);
-      (mesh.material as THREE.Material).dispose();
-      meshes.delete(id);
+      scene.remove(character.root);
+      character.dispose();
+      characters.delete(id);
     }
   }
 
