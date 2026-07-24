@@ -37,6 +37,7 @@ import {
   type EntityKind,
 } from '@crawling-dark/shared';
 import { Connection } from './net/Connection';
+import { Predictor } from './predict/Predictor';
 import { Controls } from './input/Controls';
 import { FollowCamera } from './scene/FollowCamera';
 import { buildTown } from './scene/TownView';
@@ -117,6 +118,21 @@ const connection = new Connection();
 const controls = new Controls();
 controls.attachPointerLock(renderer.domElement);
 connection.connect();
+
+/**
+ * Client-side prediction for the LOCAL player (M6 · t6a). Fed this frame's input
+ * immediately so our own body reacts without a round-trip, then corrected against
+ * each authoritative snapshot. Remote entities are untouched — they keep flowing
+ * through the interpolator (see {@link Predictor}).
+ */
+const predictor = new Predictor();
+
+/**
+ * Server tick of the last snapshot we reconciled against, so we reconcile exactly
+ * once per new snapshot (the tick strictly increases between snapshots). `null`
+ * until the first reconcile lands.
+ */
+let lastReconciledTick: number | null = null;
 
 /**
  * Left-click to swing the bat. Pointer lock is requested by Controls on the
@@ -491,14 +507,49 @@ function animate(): void {
   const dtMs = dt * 1000;
   const now = performance.now();
 
-  // 1. Push this frame's input (held-key bitmask + look yaw) to the server.
-  connection.sendInput(controls.keys, dt, controls.yaw);
+  // 1. Push this frame's input (held-key bitmask + look yaw) to the server,
+  //    capturing the seq so the local predictor can key its input history by it.
+  const seq = connection.sendInput(controls.keys, dt, controls.yaw);
 
   // 2. Build the town once we know the seed.
   ensureWorld();
 
+  // 2b. Mirror this frame's input into the local predictor so our own body moves
+  //     instantly (needs the town for the same XZ collision the server applies).
+  if (world !== null) {
+    predictor.record(seq, controls.keys, controls.yaw, dt, world);
+  }
+
   // 3. Sample the interpolated world once; reused for events, meshes, and HUD.
   const entities = connection.sampleEntities(now);
+
+  // 3b. Reconcile the predictor once per new authoritative snapshot: snap onto the
+  //     server's local-player state, drop acked inputs, replay the unacked tail.
+  if (
+    world !== null &&
+    connection.playerId !== null &&
+    connection.tick !== lastReconciledTick
+  ) {
+    const serverLocal = connection.entities.get(connection.playerId);
+    if (serverLocal !== undefined) {
+      predictor.reconcile(serverLocal, connection.ack, world);
+      lastReconciledTick = connection.tick;
+    }
+  }
+
+  // 3c. Render override (upstream of syncEntities so that module stays decoupled):
+  //     replace ONLY the local entity's transform with the predicted values,
+  //     leaving its kind/state — and every remote entity — interpolated as before.
+  if (predictor.hasBase && connection.playerId !== null) {
+    const me = entities.get(connection.playerId);
+    if (me !== undefined) {
+      const p = predictor.predicted;
+      me.x = p.x;
+      me.y = p.y;
+      me.z = p.z;
+      me.yaw = p.yaw;
+    }
+  }
 
   // 4. Turn this frame's server events into VFX + turn-feed lines. Positions
   //    fall back to the actor/target entity when an event omits coordinates.

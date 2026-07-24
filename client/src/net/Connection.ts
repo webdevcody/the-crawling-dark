@@ -422,21 +422,29 @@ export class Connection {
 
   /**
    * Send one sampled input frame. Called once per render frame with the live
-   * held-key bitmask; `seq` auto-increments so the server can ack it. `yaw` is
-   * fixed to 0 in M1 (no look controls yet). No-op while the socket is down.
+   * held-key bitmask and look yaw; `seq` auto-increments so the server can ack it.
+   * Sending is a no-op while the socket is down, but the `seq` is still allocated
+   * and returned so the caller's local prediction history stays continuous.
+   *
+   * Returns the `seq` assigned to this frame so the client-side predictor (M6) can
+   * key its input history by it and reconcile against the server's `ack`. Existing
+   * callers may ignore the return value — this is a backward-compatible change.
    *
    * @param keys Held-key bitmask (see `InputKey` in the shared protocol).
    * @param dt   Frame delta in seconds (advisory; the server is authoritative).
-   * @param yaw  Aim yaw in radians (0 in M1).
+   * @param yaw  Aim/look yaw in radians.
+   * @returns The monotonic input `seq` sent for this frame.
    */
-  sendInput(keys: number, dt: number, yaw = 0): void {
+  sendInput(keys: number, dt: number, yaw = 0): number {
+    const seq = ++this.inputSeq;
     this.send({
       t: MessageType.Input,
-      seq: ++this.inputSeq,
+      seq,
       keys,
       yaw,
       dt,
     });
+    return seq;
   }
 
   /**
