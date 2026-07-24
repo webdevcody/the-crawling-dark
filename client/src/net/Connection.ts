@@ -27,6 +27,7 @@ import {
   decodeServerMessage,
   type EntitySnapshot,
   type GameEvent,
+  type RoundMessage,
 } from '@crawling-dark/shared';
 
 import { SnapshotInterpolator, type InterpolatedEntity } from './Interpolation';
@@ -143,6 +144,14 @@ export class Connection {
   /** Smoothed round-trip time in milliseconds (0 until the first PONG). */
   private smoothedRtt = 0;
 
+  /**
+   * Latest ROUND frame (phase + clock + score), or `null` before the first one
+   * arrives. Cleared to `null` on disconnect so a stale win/lose banner can't
+   * linger over a reconnect gap — the HUD falls back to its pre-ROUND look until
+   * the server's next ROUND repaints it.
+   */
+  private roundValue: RoundMessage | null = null;
+
   private inputSeq = 0;
   private attackSeq = 0;
   private pingSeq = 0;
@@ -189,6 +198,16 @@ export class Connection {
   /** Smoothed round-trip time in milliseconds. */
   get rttMs(): number {
     return this.smoothedRtt;
+  }
+
+  /**
+   * Latest ROUND frame (phase, clock, score, lobby ready-gate), or `null`
+   * before the first one arrives or after a disconnect. The HUD reads this each
+   * frame to drive its banner + counts; a `null` return means "no round state
+   * yet", for which the HUD shows a graceful placeholder.
+   */
+  get round(): RoundMessage | null {
+    return this.roundValue;
   }
 
   /** Read-only view of the current entity store. */
@@ -239,6 +258,7 @@ export class Connection {
     this.stopPingLoop();
     this.interp.clear();
     this.pendingEvents.length = 0;
+    this.roundValue = null;
     if (this.socket) {
       this.socket.onopen = null;
       this.socket.onmessage = null;
@@ -289,6 +309,9 @@ export class Connection {
     // gap; the interpolator refills from fresh snapshots after we reconnect.
     this.interp.clear();
     this.pendingEvents.length = 0;
+    // Clear the round so a stale win/lose banner can't linger across the gap;
+    // the server's next ROUND repaints it after we reconnect.
+    this.roundValue = null;
     this.socket = null;
     if (this.disposed) {
       this.statusValue = 'closed';
@@ -364,9 +387,14 @@ export class Connection {
         this.enqueueEvents([msg]);
         break;
 
-      // ROUND is not consumed on the client: team counts are derived from the
-      // entity kinds each render frame, which keeps the HUD correct even if the
-      // server never sends ROUND. Ignore it (and any unknown type) for now.
+      case MessageType.Round:
+        // Latest round phase + clock + score. Stored whole (the `t` tag rides
+        // along harmlessly) and surfaced via {@link round}; the HUD drives its
+        // banner, lobby ready-gate, and live counts from this each frame.
+        this.roundValue = msg;
+        break;
+
+      // Any unknown/future message type: ignore it rather than crash.
       default:
         break;
     }
@@ -420,6 +448,18 @@ export class Connection {
    */
   sendAttack(): void {
     this.send({ t: MessageType.Attack, seq: ++this.attackSeq });
+  }
+
+  /**
+   * Toggle our lobby ready state. The server tallies readied players and starts
+   * the countdown once {@link MIN_PLAYERS_TO_START} are ready, echoing the count
+   * back on each ROUND (`readyCount`/`playerCount`) during the lobby phase. We
+   * only fire the intent here; like {@link sendAttack} it is a no-op while the
+   * socket is down (the caller keeps the authoritative flag and the server
+   * clears readiness on every reset, so a dropped toggle self-heals).
+   */
+  sendReady(ready: boolean): void {
+    this.send({ t: MessageType.Ready, ready });
   }
 
   private startPingLoop(): void {
