@@ -23,8 +23,10 @@ import {
   RESPAWN_DELAY_MS,
   generateWorld,
   collideCircleXZ,
+  createMoveState,
   step,
   type World,
+  type EntityKind,
   type EntitySnapshot,
   type EntityState,
   type GameEvent,
@@ -35,6 +37,7 @@ import {
   type WireData,
 } from '@crawling-dark/shared';
 import { Player } from './Player';
+import { Round } from './Round';
 import { ZombieAI, forwardFromYaw, type ZombieIntent } from './ai';
 
 /**
@@ -118,8 +121,22 @@ export class Room {
   /**
    * Reactive steering brain for the NPC patient-zero zombie (M4 · t4a), built
    * over the same seeded {@link world} it navigates and collides against.
+   *
+   * MUTABLE by design (M5): the AI keeps a private per-NPC memory map keyed by
+   * entity id (targets, line-of-sight grace). On every return to the lobby the
+   * NPC is removed and a fresh brain is assigned here, which is the cleanest way
+   * to drop that stale memory without reaching into `ai.ts`.
    */
-  private readonly zombieAI = new ZombieAI(this.world);
+  private zombieAI = new ZombieAI(this.world);
+
+  /**
+   * Authoritative round lifecycle (M5 · t5a): a thin {@link Round} value object
+   * owning the phase, its countdown timer, and the winner. The Room drives it
+   * from {@link step} by reading live counts each tick — spawning/removing the
+   * NPC, resetting players, and buffering round events as the phase changes —
+   * so the machine stays a pure timekeeper and the Room owns all side effects.
+   */
+  private readonly round = new Round();
 
   /** Next id to hand out. Only ever increments, so ids are never reused. */
   private nextPlayerId = 1;
@@ -152,13 +169,53 @@ export class Room {
     return this.players.size;
   }
 
-  /** Count of active (non-spectator) players currently simulated. */
+  /** Count of active (non-spectator, non-NPC) players currently simulated. */
   private activeCount(): number {
     let n = 0;
     for (const p of this.players.values()) {
       if (!p.spectator && !p.isNpc) n++;
     }
     return n;
+  }
+
+  /**
+   * Count of active players who have readied up (t5b). Spectators and NPCs can
+   * never be ready, so this is always ≤ {@link activeCount}; the round machine
+   * starts the countdown once it reaches {@link MIN_PLAYERS_TO_START}.
+   */
+  private readyCount(): number {
+    let n = 0;
+    for (const p of this.players.values()) {
+      if (p.spectator || p.isNpc) continue;
+      if (p.ready) n++;
+    }
+    return n;
+  }
+
+  /**
+   * Count of humans still standing (t5c): active players on team `'human'` that
+   * are not downed. This is the live figure the win/lose evaluation reads each
+   * active tick — 0 means everyone has been turned (zombies win), ≥1 at the
+   * clock's expiry means the humans survived.
+   */
+  private humansAliveCount(): number {
+    let n = 0;
+    for (const p of this.players.values()) {
+      if (p.spectator || p.isNpc) continue;
+      if (p.team === 'human' && !p.down) n++;
+    }
+    return n;
+  }
+
+  /**
+   * The fixed spawn-ring slot for a player id — a deterministic golden-angle
+   * placement around the origin so successive spawns fan out instead of
+   * stacking. Shared by {@link join} (first placement) and {@link resetPlayers}
+   * (respawn on a fresh round) so the two never drift apart.
+   */
+  private spawnPoint(id: number): { x: number; z: number } {
+    const angle = id * GOLDEN_ANGLE;
+    return { x: Math.cos(angle) * SPAWN_RING_RADIUS, z: Math.sin(angle) * SPAWN_RING_RADIUS };
   }
 
   /**
@@ -170,12 +227,11 @@ export class Room {
     const id = this.nextPlayerId++;
     const spectator = this.activeCount() >= MAX_PLAYERS;
 
-    // Spread spawns around a small ring so overlapping tabs don't stack.
-    const angle = id * GOLDEN_ANGLE;
-    const x = spectator ? 0 : Math.cos(angle) * SPAWN_RING_RADIUS;
-    const z = spectator ? 0 : Math.sin(angle) * SPAWN_RING_RADIUS;
+    // Spread spawns around a small ring so overlapping tabs don't stack; a
+    // spectator has no entity, so it sits at the origin.
+    const spawn = spectator ? { x: 0, z: 0 } : this.spawnPoint(id);
 
-    const player = new Player(id, socket, spectator, x, z);
+    const player = new Player(id, socket, spectator, spawn.x, spawn.z);
     this.players.set(id, player);
 
     const welcome: WelcomeMessage = {
@@ -229,6 +285,14 @@ export class Room {
         player.attackCooldownMs = ATTACK_COOLDOWN_MS;
         break;
 
+      case MessageType.Ready:
+        // t5b: record the lobby ready toggle. Spectators and NPCs have no say
+        // (they can't ready up), so ignore it for them. We deliberately do NOT
+        // start the countdown here — the round state machine polls readiness
+        // every tick, keeping a single source of truth for when a round begins.
+        if (!player.spectator && !player.isNpc) player.ready = msg.ready;
+        break;
+
       case MessageType.Ping: {
         // t1e: echo the probe id straight back so the client can time RTT.
         const pong: PongMessage = { t: MessageType.Pong, id: msg.id };
@@ -237,7 +301,7 @@ export class Room {
       }
 
       default:
-        // READY: no-op until the M5 lobby/round state machine.
+        // Unknown / server-only message tags are ignored.
         break;
     }
   }
@@ -286,33 +350,40 @@ export class Room {
 
   /**
    * Advance exactly one fixed tick, in the DESIGN §5 pipeline order:
-   *  - ensure the single NPC patient-zero zombie exists (M4 · t4a);
-   *  - step 2: integrate each active player's movement (honoring stun/down);
-   *  - step 3: advance the NPC zombie AI (seek + avoid + contact attack);
-   *  - step 4: resolve bat swings (cone hit -> stun + knockback);
-   *  - step 5: resolve infections (open zombie window -> down human);
-   *  - flip any elapsed death-cams onto the zombie team;
-   *  - every ~2nd tick, broadcast a snapshot + round counts.
+   *  - step 2: integrate each active player's movement (honoring stun/down) —
+   *    ALWAYS, in every phase, so the lobby and countdown stay walkable;
+   *  - steps 3-5 (ONLY while the round is `active`): advance the NPC zombie AI
+   *    (seek + avoid + contact attack), resolve bat swings (cone hit -> stun +
+   *    knockback), resolve infections (open zombie window -> down human), then
+   *    flip any elapsed death-cams onto the zombie team;
+   *  - step 6: drive the round state machine (t5a/t5b/t5c) — poll readiness,
+   *    tick the phase clock, evaluate win/lose, and perform the phase side
+   *    effects (spawn/remove the NPC, reset players, buffer round events);
+   *  - every ~2nd tick, broadcast a snapshot + the real ROUND message.
    *
-   * (The round state machine — §5 step 6 — arrives in M5; the count-only ROUND
-   * stands in until then.)
+   * The AI/combat block is gated to the `active` phase so nothing hunts or
+   * fights in the lobby, countdown, or results screen. It runs BEFORE the round
+   * update so the win/lose check reads the freshly-resolved live human count
+   * (e.g. a last human downed this very tick already reads as turned).
    */
   private step(): void {
-    this.ensureNpcZombie();
-
-    // Step 2 — integrate the human-controlled players from their inputs.
+    // Step 2 — integrate the human-controlled players from their inputs. This
+    // runs in every phase so players can mill about the lobby / countdown.
     for (const p of this.players.values()) {
       if (p.spectator || p.isNpc) continue;
       this.integrate(p);
     }
 
-    // Step 3 — advance the NPC zombie AI (seek + building avoidance, then its
-    // contact-attack decision) now that the humans have moved this tick.
-    this.updateNpcs();
+    // Steps 3-5 — the AI + combat/infection pipeline, live only during a round.
+    if (this.round.phase === 'active') {
+      this.updateNpcs();
+      this.resolveAttacks();
+      this.resolveInfections();
+      this.resolveRespawns();
+    }
 
-    this.resolveAttacks();
-    this.resolveInfections();
-    this.resolveRespawns();
+    // Step 6 — advance the round lifecycle after this tick's world is settled.
+    this.updateRound();
 
     this.tick++;
 
@@ -367,26 +438,164 @@ export class Room {
   /* Combat resolution (t3a/t3b/t3c)                                          */
   /* ------------------------------------------------------------------------ */
 
+  /* ------------------------------------------------------------------------ */
+  /* Round state machine (t5a/t5b/t5c)                                        */
+  /* ------------------------------------------------------------------------ */
+
   /**
-   * Ensure the single NPC "patient zero" zombie exists once a game is under way
-   * (M4 · t4a). Standing in for the M5 round state machine, we treat "enough
-   * humans have connected to play" ({@link MIN_PLAYERS_TO_START} active players)
-   * as the round start and, exactly once, spawn one server-controlled zombie out
-   * on the ring road. The horde then grows ONLY from turned players: no further
-   * NPCs are ever spawned, and no human is auto-promoted.
+   * Drive the round lifecycle one fixed step. Dispatches on the current phase;
+   * each handler reads live counts, ticks its clock, and requests the
+   * transitions + side effects for that phase. Called once per {@link step}
+   * with the fixed `dtMs = TICK_MS`, keeping the whole machine deterministic and
+   * in lockstep with the simulation (no wall-clock timing anywhere).
    */
-  private ensureNpcZombie(): void {
-    if (this.hasNpc()) return;
-    if (this.activeCount() < MIN_PLAYERS_TO_START) return;
-    this.spawnNpcZombie();
+  private updateRound(): void {
+    switch (this.round.phase) {
+      case 'lobby':
+        this.updateLobby();
+        break;
+      case 'countdown':
+        this.updateCountdown();
+        break;
+      case 'active':
+        this.updateActive();
+        break;
+      case 'ended':
+        this.updateEnded();
+        break;
+    }
   }
 
-  /** Whether the lone NPC patient-zero zombie has already been spawned. */
-  private hasNpc(): boolean {
-    for (const p of this.players.values()) {
-      if (p.isNpc) return true;
+  /**
+   * LOBBY (t5b): idle until enough players have readied up. Start the countdown
+   * once at least {@link MIN_PLAYERS_TO_START} active players are ready AND at
+   * least that many are actually present. (Ready implies active, so the second
+   * check is belt-and-braces, but it states the intent explicitly.)
+   */
+  private updateLobby(): void {
+    if (this.activeCount() >= MIN_PLAYERS_TO_START && this.readyCount() >= MIN_PLAYERS_TO_START) {
+      this.round.toCountdown();
     }
-    return false;
+  }
+
+  /**
+   * COUNTDOWN (t5a): tick the pre-round clock down. If the active roster falls
+   * below {@link MIN_PLAYERS_TO_START} before it expires (someone left), abandon
+   * the countdown and fall back to a fresh lobby. When the clock reaches 0, the
+   * round begins.
+   */
+  private updateCountdown(): void {
+    if (this.activeCount() < MIN_PLAYERS_TO_START) {
+      this.resetToLobby();
+      return;
+    }
+    this.round.tick(TICK_MS);
+    if (this.round.timeLeftMs <= 0) this.startRound();
+  }
+
+  /**
+   * ACTIVE (t5a/t5c): tick the 5:00 survival clock, then evaluate win/lose on
+   * the freshly-settled world (this runs after the combat block in {@link step},
+   * so a human downed this very tick already counts as turned).
+   *
+   * Ordering encodes the DESIGN rules:
+   *  - if the whole room emptied mid-round, there is no one to win — bail
+   *    gracefully to the lobby rather than declaring a hollow victory;
+   *  - ZOMBIES win the instant the live human count hits 0 (everyone turned).
+   *    This cannot mis-fire on the first active tick: the round begins with all
+   *    players human, and this handler only runs on ticks AFTER the countdown
+   *    handler flipped us to `active`, so the count read here is never stale;
+   *  - otherwise HUMANS win when the clock expires with at least one survivor.
+   *    Zombie-win is checked first, so a simultaneous "last human turns as the
+   *    clock hits 0" resolves as a zombie win, per spec.
+   */
+  private updateActive(): void {
+    // Everyone disconnected: no round to adjudicate, just return to the lobby.
+    if (this.activeCount() === 0) {
+      this.resetToLobby();
+      return;
+    }
+
+    this.round.tick(TICK_MS);
+
+    const humansAlive = this.humansAliveCount();
+    if (humansAlive === 0) {
+      this.endRound('zombie');
+    } else if (this.round.timeLeftMs <= 0) {
+      this.endRound('human');
+    }
+  }
+
+  /**
+   * ENDED (t5a): hold on the results/scoreboard clock, then recycle the room
+   * back to a clean lobby (reset players, drop the NPC) when it expires.
+   */
+  private updateEnded(): void {
+    this.round.tick(TICK_MS);
+    if (this.round.timeLeftMs <= 0) this.resetToLobby();
+  }
+
+  /**
+   * Begin the active round: arm the survival clock, spawn the single NPC patient
+   * zero out on the ring road (M4 · t4a; the horde grows only from turned
+   * players thereafter), and buffer a one-off {@link 'roundStart'} event so
+   * clients get a discrete "go" signal alongside the phase flip.
+   */
+  private startRound(): void {
+    this.round.toActive();
+    this.spawnNpcZombie();
+    this.buffer({ kind: 'roundStart' });
+  }
+
+  /**
+   * End the active round with a decided `winner`: move to the results phase and
+   * buffer a one-off {@link 'roundEnd'} event so clients can play the sting /
+   * show the scoreboard exactly once.
+   */
+  private endRound(winner: EntityKind): void {
+    this.round.toEnded(winner);
+    this.buffer({ kind: 'roundEnd' });
+  }
+
+  /**
+   * Return to a clean lobby: flip the phase and wipe the world back to its
+   * pre-round state (see {@link resetPlayers}). Used both when a round ends and
+   * whenever a countdown/active game collapses because too few players remain.
+   */
+  private resetToLobby(): void {
+    this.round.toLobby();
+    this.resetPlayers();
+  }
+
+  /**
+   * Wipe the world back to a fresh, pre-round state for a new lobby (t5a):
+   *  - remove every NPC (the patient-zero zombie) from the room;
+   *  - assign a brand-new {@link ZombieAI} so no stale per-NPC memory (targets,
+   *    LOS grace) leaks across rounds — the AI keys its state map by entity id,
+   *    and ids are never reused, so replacing the whole brain is the clean drop;
+   *  - turn every active player back into a fresh HUMAN: reset team, clear all
+   *    combat/infection state, un-ready them, and respawn them on their fixed
+   *    golden-angle ring slot (a full new {@link MoveState}, so any jump/crawl/
+   *    velocity is cleared too).
+   * Spectators are left untouched — they carry no entity or combat state.
+   */
+  private resetPlayers(): void {
+    // Drop the NPC(s) first so the loop below only touches real players.
+    for (const p of this.players.values()) {
+      if (p.isNpc) this.players.delete(p.id);
+    }
+
+    // Fresh AI brain → stale per-NPC memory from the last round is gone.
+    this.zombieAI = new ZombieAI(this.world);
+
+    for (const p of this.players.values()) {
+      if (p.spectator) continue; // (NPCs already removed above)
+      p.team = 'human';
+      this.clearCombatState(p);
+      p.ready = false;
+      const spawn = this.spawnPoint(p.id);
+      p.move = createMoveState({ x: spawn.x, z: spawn.z });
+    }
   }
 
   /**
@@ -723,13 +932,16 @@ export class Room {
   }
 
   /**
-   * Broadcast a lightweight {@link RoundMessage} carrying live team counts so
-   * the HUD can read them (t3c): humans still alive (human team, not down, not
-   * spectator) and zombies (zombie team, not spectator).
+   * Broadcast the authoritative {@link RoundMessage} (t5a/t5b/t5c): the live
+   * {@link Round} phase and clock plus the current team scoreline, at the
+   * snapshot cadence.
    *
-   * NOTE: `phase`/`timeLeftMs` are placeholders until M5 builds the real round
-   * state machine (lobby -> countdown -> active -> ended) with the 5:00 clock
-   * and win/lose. M3 only needs the counts.
+   * Counts (non-spectators only): `zombieCount` is every zombie-team entity —
+   * the NPC patient zero included — and `humansAlive` every standing human. The
+   * phase-scoped optional fields mirror the frozen wire contract exactly:
+   *  - `winner` is attached only while `phase === 'ended'`;
+   *  - `readyCount`/`playerCount` are attached only in the `lobby`, so the HUD
+   *    can render the "READY n/total" gate, and omitted everywhere else.
    */
   private broadcastRound(): void {
     let humansAlive = 0;
@@ -742,11 +954,20 @@ export class Room {
 
     const round: RoundMessage = {
       t: MessageType.Round,
-      phase: 'active',
-      timeLeftMs: 0,
+      phase: this.round.phase,
+      timeLeftMs: this.round.timeLeftMs,
       humansAlive,
       zombieCount,
     };
+
+    if (this.round.phase === 'ended' && this.round.winner !== undefined) {
+      round.winner = this.round.winner;
+    }
+    if (this.round.phase === 'lobby') {
+      round.readyCount = this.readyCount();
+      round.playerCount = this.activeCount();
+    }
+
     for (const p of this.players.values()) this.send(p, round);
   }
 

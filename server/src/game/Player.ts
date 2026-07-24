@@ -67,6 +67,18 @@ export class Player {
    */
   readonly spectator: boolean;
 
+  /**
+   * Lobby ready-up flag (M5 · t5b). A connected, playing client toggles this via
+   * {@link ReadyMessage}; the round state machine counts ready, non-spectator,
+   * non-NPC players each tick and starts the countdown once
+   * {@link MIN_PLAYERS_TO_START} are ready — readiness is the single source of
+   * truth, polled by the machine rather than starting the round inline. Defaults
+   * to `false`, and the Room clears it on every return to the lobby so each new
+   * round demands a fresh ready-up. Spectators and NPCs can never toggle it, so
+   * it stays `false` for them.
+   */
+  ready = false;
+
   /* ---------------------------------------------------------------------- */
   /* Combat & infection state (M3)                                          */
   /* ---------------------------------------------------------------------- */

@@ -17,6 +17,13 @@
  * server's attack/stun/infect events (drained from {@link Connection.drainEvents})
  * spawn short-lived VFX and feed a bottom-left kill/turn ticker.
  *
+ * M5 (t5d) surfaces the round loop so a full match reads on screen: the inline
+ * status readout is replaced by the {@link HUD} module, driven each frame from
+ * the server's ROUND messages (lobby -> countdown -> the 5:00 round -> a
+ * win/lose banner -> back to lobby). `R` toggles the local lobby ready state
+ * (streamed via {@link Connection.sendReady}); the flag resets whenever the
+ * round returns to `lobby`, matching the server clearing readiness on reset.
+ *
  * There is no client-side prediction yet — the local player is also drawn from
  * interpolated server state, so it lags input slightly. Prediction/reconciliation
  * is M6 (t6a); until then this is the interpolation-only MVP the design calls for.
@@ -36,6 +43,7 @@ import { Connection } from './net/Connection';
 import { Controls } from './input/Controls';
 import { FollowCamera } from './scene/FollowCamera';
 import { buildTown } from './scene/TownView';
+import { HUD } from './ui/HUD';
 import type { InterpolatedEntity } from './net/Interpolation';
 
 const app = document.querySelector<HTMLDivElement>('#app') ?? document.body;
@@ -131,6 +139,34 @@ renderer.domElement.addEventListener('mousedown', (ev) => {
   if (!controls.pointerLocked) return;
   connection.sendAttack();
 });
+
+/* -------------------------------------------------------------------------- */
+/* Lobby ready toggle (R)                                                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Our local lobby ready state, the source of truth for the `R` toggle. It is
+ * mirrored to the server via {@link Connection.sendReady} on each press and read
+ * by the HUD to show your ready status. The server clears everyone's readiness
+ * on a round reset, so we reset this to `false` on every transition back to the
+ * `lobby` phase (detected off ROUND below) to stay in lock-step.
+ */
+let localReady = false;
+
+/**
+ * `R` toggles ready. Bound on `window` (not the canvas) so it works in the
+ * lobby, which is played WITHOUT pointer lock — a click-to-lock gate would make
+ * readying up impossible. Auto-repeat is ignored so a held key can't rapidly
+ * flip the state, mirroring how {@link Controls} debounces the crawl toggle.
+ */
+window.addEventListener('keydown', (ev) => {
+  if (ev.code !== 'KeyR' || ev.repeat) return;
+  localReady = !localReady;
+  connection.sendReady(localReady);
+});
+
+/** Last round phase we observed, to detect the transition back into `lobby`. */
+let lastPhase: string | null = null;
 
 /* -------------------------------------------------------------------------- */
 /* Town — built once WELCOME's mapSeed arrives (identical to the server's)     */
@@ -554,75 +590,26 @@ function updateFeed(dtMs: number): void {
 }
 
 /* -------------------------------------------------------------------------- */
-/* HUD overlay                                                                */
+/* HUD overlay — the round-loop heads-up display (status panel + banner)        */
 /* -------------------------------------------------------------------------- */
 
-const hud = document.createElement('div');
-Object.assign(hud.style, {
-  position: 'fixed',
-  top: '12px',
-  left: '12px',
-  padding: '10px 14px',
-  font: '12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace',
-  color: '#c8d6e5',
-  background: 'rgba(5, 7, 10, 0.72)',
-  border: '1px solid rgba(58, 90, 106, 0.5)',
-  borderRadius: '6px',
-  pointerEvents: 'none',
-  userSelect: 'none',
-  whiteSpace: 'pre',
-  backdropFilter: 'blur(2px)',
-} satisfies Partial<CSSStyleDeclaration>);
-app.appendChild(hud);
-
-/** Color-tagged status dot for the HUD. */
-function statusColor(status: string): string {
-  switch (status) {
-    case 'open':
-      return '#53ffa8';
-    case 'connecting':
-    case 'reconnecting':
-      return '#ffd24a';
-    default:
-      return '#ff6b6b';
-  }
-}
+/**
+ * The round HUD (status panel + phase-driven round banner), mounted into the
+ * same `#app` container as the renderer. Built once here and refreshed every
+ * frame in {@link animate} from the connection's latest ROUND plus a little
+ * local state (the team derived from the local entity, and {@link localReady}).
+ */
+const hud = new HUD(app);
 
 /**
- * Refresh the status HUD. Team counts are derived from the interpolated entity
- * `kind`s each frame (downed humans are excluded from "alive"), which keeps the
- * readout correct even if the server never sends a ROUND message. Your own team
- * comes from your entity's `kind`.
+ * Resolve the local player's team from its interpolated entity `kind`, or `null`
+ * if we haven't spawned yet (pre-WELCOME, or spectating). The HUD shows `—` for
+ * a `null` team; the authoritative score comes from ROUND, not this.
  */
-function updateHud(entities: Map<number, InterpolatedEntity>): void {
-  const status = connection.status;
-  const lookHint = controls.pointerLocked
-    ? 'mouse: look (Esc releases)'
-    : 'click canvas to look';
-
-  // Live team tally from the entity set (downed humans no longer count alive).
-  let humansAlive = 0;
-  let zombieCount = 0;
-  for (const e of entities.values()) {
-    if (e.kind === 'zombie') zombieCount += 1;
-    else if (e.state !== 'down') humansAlive += 1;
-  }
+function localTeam(entities: Map<number, InterpolatedEntity>): EntityKind | null {
   const localId = connection.playerId;
   const me = localId !== null ? entities.get(localId) : undefined;
-  const team = me ? me.kind : '—';
-
-  hud.innerHTML =
-    `<span style="color:${statusColor(status)}">●</span> ` +
-    `<b>The Crawling Dark</b> · M3\n` +
-    `status    ${status}\n` +
-    `playerId  ${connection.playerId ?? '—'}\n` +
-    `team      ${team}\n` +
-    `humans    ${humansAlive}    zombies   ${zombieCount}\n` +
-    `tick      ${connection.tick}\n` +
-    `rtt       ${connection.rttMs > 0 ? `${Math.round(connection.rttMs)} ms` : '—'}\n` +
-    `move      WASD · Shift run · C crawl${controls.crawling ? ' [on]' : ''} · Space jump\n` +
-    `combat    Left-click: swing bat\n` +
-    `${lookHint}`;
+  return me ? me.kind : null;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -700,8 +687,27 @@ function animate(): void {
     follow.update(localFeet, controls.yaw, world, dt);
   }
 
-  // 8. Refresh the HUD (team + live counts derived from the entity set).
-  updateHud(entities);
+  // 8. Refresh the round HUD from the latest ROUND + connection/local state.
+  //    On every transition BACK into the lobby, clear our local ready flag to
+  //    match the server (which drops all readiness on a round reset), so the
+  //    HUD never shows "ready" carried over from the previous match.
+  const round = connection.round;
+  const phase = round?.phase ?? null;
+  if (phase === 'lobby' && lastPhase !== 'lobby') localReady = false;
+  lastPhase = phase;
+
+  hud.update({
+    round,
+    status: connection.status,
+    playerId: connection.playerId,
+    rttMs: connection.rttMs,
+    tick: connection.tick,
+    team: localTeam(entities),
+    ready: localReady,
+    lookHint: controls.pointerLocked
+      ? 'mouse: look (Esc releases)'
+      : 'click canvas to look',
+  });
 
   renderer.render(scene, camera);
 }
@@ -712,4 +718,5 @@ renderer.setAnimationLoop(animate);
 window.addEventListener('beforeunload', () => {
   connection.close();
   controls.dispose();
+  hud.dispose();
 });
