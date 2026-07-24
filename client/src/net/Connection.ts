@@ -23,10 +23,14 @@
 import {
   MessageType,
   DEFAULT_SERVER_PORT,
+  SNAPSHOT_BASELINE_RING,
   encode,
   decodeServerMessage,
+  decodeSnapshotBinary,
   type EntitySnapshot,
   type GameEvent,
+  type InputMessage,
+  type JoinMessage,
   type RoundMessage,
 } from '@crawling-dark/shared';
 
@@ -67,6 +71,16 @@ const MAX_PENDING_PINGS = 32;
  * loop stalls (e.g. a backgrounded tab stops draining); the newest events win.
  */
 const MAX_PENDING_EVENTS = 128;
+
+/**
+ * How many recently applied full snapshot states to retain, keyed by tick, for
+ * applying binary deltas (M7 · t7b). A delta names the ACKed `baselineTick` it
+ * was diffed against; we rebuild the world by applying it onto the stored state
+ * for that tick. Kept a little deeper than the server's {@link SNAPSHOT_BASELINE_RING}
+ * so the baseline the server chose is always still present locally even while
+ * an ack is in flight. Unused while the wire is JSON.
+ */
+const SNAPSHOT_HISTORY = SNAPSHOT_BASELINE_RING + 8;
 
 /* -------------------------------------------------------------------------- */
 /* URL resolution                                                             */
@@ -135,11 +149,38 @@ export class Connection {
   /** Deterministic town seed from WELCOME. `null` until the first WELCOME. */
   private mapSeedValue: number | null = null;
 
+  /**
+   * Reconnect session token from the most recent WELCOME (M7 · t7d), or `null`
+   * before the first one. It is echoed back in the JOIN on EVERY (re)open so a
+   * reconnect presents it and the server can restore our original id/team; a
+   * first connect sends no token. Deliberately NOT cleared on socket close — it
+   * must survive the drop so the auto-reconnect can hand it back — so it
+   * persists across the whole session and only ever advances to a newer token.
+   */
+  private sessionToken: string | null = null;
+
   /** Latest server tick seen in a SNAPSHOT. */
   private serverTick = 0;
 
   /** Most recent input `seq` the server has acknowledged (SNAPSHOT.ack). */
   private ackSeq = 0;
+
+  /**
+   * Tick of the most recent snapshot we have fully applied, sent back to the
+   * server as {@link InputMessage.snapAck} so it can delta-compress against a
+   * baseline we are confirmed to hold (M7 · t7b). `null` until the first
+   * snapshot lands (so the server's first frame to us is always a FULL one).
+   */
+  private snapAckTick: number | null = null;
+
+  /**
+   * Recently applied FULL entity states keyed by their snapshot tick — the
+   * baselines binary deltas are applied onto (M7 · t7b). Each entry is the
+   * complete reconstructed entity list for that tick; capped at
+   * {@link SNAPSHOT_HISTORY} (oldest evicted). Cleared on disconnect so a
+   * reconnect starts clean from the server's next full frame.
+   */
+  private readonly snapshotHistory = new Map<number, EntitySnapshot[]>();
 
   /** Smoothed round-trip time in milliseconds (0 until the first PONG). */
   private smoothedRtt = 0;
@@ -257,6 +298,8 @@ export class Connection {
     this.clearReconnect();
     this.stopPingLoop();
     this.interp.clear();
+    this.snapshotHistory.clear();
+    this.snapAckTick = null;
     this.pendingEvents.length = 0;
     this.roundValue = null;
     if (this.socket) {
@@ -286,6 +329,10 @@ export class Connection {
       return;
     }
     this.socket = ws;
+    // Snapshots arrive as binary frames (M7 · t7a); ask for ArrayBuffers so
+    // handleMessage can tell a snapshot (ArrayBuffer) from the JSON control
+    // messages (string) purely by payload type.
+    ws.binaryType = 'arraybuffer';
 
     ws.onopen = () => this.handleOpen();
     ws.onmessage = (ev) => this.handleMessage(ev.data);
@@ -298,7 +345,12 @@ export class Connection {
   private handleOpen(): void {
     this.statusValue = 'open';
     this.reconnectAttempts = 0;
-    this.send({ t: MessageType.Join, name: this.name });
+    // Announce ourselves. On a reconnect we carry the token from our last
+    // WELCOME so the server can reclaim our original identity/team within its
+    // grace window (M7 · t7d); a first connect has no token and gets a fresh id.
+    const join: JoinMessage = { t: MessageType.Join, name: this.name };
+    if (this.sessionToken !== null) join.token = this.sessionToken;
+    this.send(join);
     this.startPingLoop();
   }
 
@@ -308,6 +360,10 @@ export class Connection {
     // Drop buffered snapshots so stale remote positions don't linger across the
     // gap; the interpolator refills from fresh snapshots after we reconnect.
     this.interp.clear();
+    // Reset the delta baselines: the reconnected socket is a fresh server-side
+    // Player, so its first frame to us will be a full snapshot again (M7 · t7b).
+    this.snapshotHistory.clear();
+    this.snapAckTick = null;
     this.pendingEvents.length = 0;
     // Clear the round so a stale win/lose banner can't linger across the gap;
     // the server's next ROUND repaints it after we reconnect.
@@ -345,6 +401,13 @@ export class Connection {
   /* ---- Inbound message handling ---------------------------------------- */
 
   private handleMessage(data: unknown): void {
+    // Binary frames are quantized SNAPSHOTs (M7 · t7a/t7b); everything else is
+    // JSON text. Branch on the payload type so the two never collide.
+    if (data instanceof ArrayBuffer) {
+      this.handleBinarySnapshot(data);
+      return;
+    }
+
     const msg = decodeServerMessage(data as string);
     if (!msg) return;
 
@@ -352,25 +415,17 @@ export class Connection {
       case MessageType.Welcome:
         this.ownId = msg.playerId;
         this.mapSeedValue = msg.mapSeed;
+        // Persist the reconnect token so the next (re)open can present it and
+        // reclaim this identity (t7d). On a reconnect the server re-issues the
+        // SAME token here alongside the SAME playerId.
+        this.sessionToken = msg.token;
         break;
 
-      case MessageType.Snapshot: {
-        this.serverTick = msg.tick;
-        this.ackSeq = msg.ack;
-        this.store.clear();
-        for (const entity of msg.entities) {
-          this.store.set(entity.id, entity);
-        }
-        // Feed the interpolation buffer, tagged with the local receive time.
-        this.interp.push(msg.entities, performance.now());
-        // Surface any events the server buffered onto this snapshot so the
-        // render loop can spawn combat VFX and update the turn feed. We stay
-        // render-agnostic here: only the raw shared events are queued.
-        if (msg.events && msg.events.length > 0) {
-          this.enqueueEvents(msg.events);
-        }
+      case MessageType.Snapshot:
+        // JSON fallback path (SNAPSHOT_WIRE === 'json'): a full snapshot. The
+        // binary path funnels through the same {@link ingestSnapshot} below.
+        this.ingestSnapshot(msg.tick, msg.ack, msg.entities, msg.events);
         break;
-      }
 
       case MessageType.Pong: {
         const sentAt = this.pendingPings.get(msg.id);
@@ -397,6 +452,97 @@ export class Connection {
       // Any unknown/future message type: ignore it rather than crash.
       default:
         break;
+    }
+  }
+
+  /**
+   * Decode and apply a binary SNAPSHOT frame (M7 · t7a/t7b).
+   *
+   *   - A FULL frame replaces our world outright.
+   *   - A DELTA frame is applied onto the stored baseline for its
+   *     `baselineTick` — an ACKed tick we are guaranteed to still hold: start
+   *     from that full state, set the changed/added entities, drop the removed
+   *     ids. That reconstructed full set then feeds the identical downstream as
+   *     any snapshot. If the baseline is somehow missing (should not happen —
+   *     the server only deltas against a frame we ACKed and our history is
+   *     deeper than its ring) we skip the frame and keep our last good state;
+   *     the next frame re-baselines once our ack catches up.
+   */
+  private handleBinarySnapshot(buf: ArrayBuffer): void {
+    let decoded;
+    try {
+      decoded = decodeSnapshotBinary(buf);
+    } catch {
+      // A malformed/opaque frame (e.g. version skew): ignore rather than crash.
+      return;
+    }
+
+    if (!decoded.isDelta) {
+      this.ingestSnapshot(decoded.tick, decoded.ack, decoded.entities, decoded.events);
+      return;
+    }
+
+    const baseline = this.snapshotHistory.get(decoded.baselineTick);
+    if (baseline === undefined) return; // baseline aged out; wait for a full frame
+
+    // Rebuild the full entity set: baseline, then apply the delta's changes.
+    const byId = new Map<number, EntitySnapshot>();
+    for (const e of baseline) byId.set(e.id, e);
+    for (const e of decoded.entities) byId.set(e.id, e);
+    for (const id of decoded.removed) byId.delete(id);
+
+    this.ingestSnapshot(
+      decoded.tick,
+      decoded.ack,
+      Array.from(byId.values()),
+      decoded.events,
+    );
+  }
+
+  /**
+   * Fold a reconstructed full snapshot (from either wire path) into the
+   * observable state: refresh the entity store, feed the interpolator, surface
+   * events, and advance `tick`/`ack`. Then remember this full state as a delta
+   * baseline and mark its tick to ACK on the next INPUT (M7 · t7b). The single
+   * choke-point both the JSON and binary paths share, so nothing downstream can
+   * tell which encoding delivered the frame.
+   */
+  private ingestSnapshot(
+    tick: number,
+    ack: number,
+    entities: readonly EntitySnapshot[],
+    events: readonly GameEvent[] | undefined,
+  ): void {
+    this.serverTick = tick;
+    this.ackSeq = ack;
+
+    this.store.clear();
+    for (const entity of entities) this.store.set(entity.id, entity);
+
+    // Feed the interpolation buffer, tagged with the local receive time.
+    this.interp.push(entities, performance.now());
+
+    // Surface any events the server buffered onto this snapshot so the render
+    // loop can spawn combat VFX and update the turn feed. We stay render-
+    // agnostic here: only the raw shared events are queued.
+    if (events && events.length > 0) this.enqueueEvents(events);
+
+    // t7b: retain this full state as a future delta baseline and ACK its tick.
+    this.recordSnapshotState(tick, entities);
+    this.snapAckTick = tick;
+  }
+
+  /**
+   * Store the full entity list for `tick` as a delta baseline, evicting the
+   * oldest once the history exceeds {@link SNAPSHOT_HISTORY}. The list is stored
+   * by reference; entity objects are treated as immutable once ingested.
+   */
+  private recordSnapshotState(tick: number, entities: readonly EntitySnapshot[]): void {
+    this.snapshotHistory.set(tick, entities.slice());
+    while (this.snapshotHistory.size > SNAPSHOT_HISTORY) {
+      const oldest = this.snapshotHistory.keys().next().value;
+      if (oldest === undefined) break;
+      this.snapshotHistory.delete(oldest);
     }
   }
 
@@ -437,13 +583,12 @@ export class Connection {
    */
   sendInput(keys: number, dt: number, yaw = 0): number {
     const seq = ++this.inputSeq;
-    this.send({
-      t: MessageType.Input,
-      seq,
-      keys,
-      yaw,
-      dt,
-    });
+    const msg: InputMessage = { t: MessageType.Input, seq, keys, yaw, dt };
+    // t7b: piggy-back the last snapshot tick we fully applied so the server can
+    // delta-compress against a baseline we are confirmed to hold. Omitted until
+    // the first snapshot arrives; ignored by the server while the wire is JSON.
+    if (this.snapAckTick !== null) msg.snapAck = this.snapAckTick;
+    this.send(msg);
     return seq;
   }
 

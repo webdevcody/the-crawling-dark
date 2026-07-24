@@ -143,6 +143,15 @@ export interface EntitySnapshot {
 export interface JoinMessage {
   t: typeof MessageType.Join;
   name: string;
+  /**
+   * Optional reconnect token from a prior {@link WelcomeMessage} (M7 · t7d).
+   * Present only on a *re*connect: the client echoes the token it was issued so
+   * the server can reclaim its original identity (id/team/position/combat) when
+   * the matching session is still inside its {@link RECONNECT_GRACE_MS} grace
+   * window. Absent on a first connect — the server then mints a fresh identity.
+   * Additive: a server that predates t7d simply ignores the extra field.
+   */
+  token?: string;
 }
 
 /**
@@ -159,6 +168,15 @@ export interface InputMessage {
   yaw: number;
   /** Client frame delta in seconds (advisory; the server is authoritative). */
   dt: number;
+  /**
+   * Snapshot-ack (M7 · t7b): the `tick` of the most recent SNAPSHOT this client
+   * has fully applied. Piggy-backed on INPUT (which the client already streams
+   * every frame) so the server learns which snapshot the client is confirmed to
+   * hold and can delta-compress the next frame against that ACKed baseline.
+   * Additive and optional — omitted until the first snapshot lands, and ignored
+   * entirely while {@link SNAPSHOT_WIRE} is `'json'`.
+   */
+  snapAck?: number;
 }
 
 /** Request a bat swing. */
@@ -200,6 +218,15 @@ export interface WelcomeMessage {
   tickRate: number;
   /** Seed the deterministic town geometry is built from (M2). */
   mapSeed: number;
+  /**
+   * Opaque session token for reconnect (M7 · t7d). The client persists this and
+   * echoes it back in a later {@link JoinMessage.token} to reclaim this exact
+   * identity after a drop, provided the reconnect lands inside the server's
+   * {@link RECONNECT_GRACE_MS} grace window. A reconnect re-issues the SAME
+   * token alongside the SAME {@link playerId}. Additive: pre-t7d clients that
+   * never read it are unaffected.
+   */
+  token: string;
 }
 
 /**

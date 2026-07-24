@@ -161,6 +161,21 @@ export const ROUND_END_SEC = 10;
 /** Post-round length in milliseconds (derived from {@link ROUND_END_SEC}). */
 export const ROUND_END_MS = ROUND_END_SEC * 1000;
 
+/**
+ * Grace window (ms) a *dropped* active player is held in the world before a
+ * disconnect becomes a real removal / forfeit (M7 · t7d). On a socket close the
+ * server does NOT delete the entity immediately: it freezes the player (held
+ * keys treated as none so it stands idle instead of running on stale input) and
+ * counts this window down one {@link TICK_MS} per tick. A reconnect presenting
+ * the player's session token inside the window reclaims the same
+ * id/team/position; if the window elapses first, the player is removed through
+ * the normal path so the round/win logic sees it leave. Spectators and NPCs are
+ * unaffected — they keep the immediate-remove behavior. Ten seconds is long
+ * enough to ride out a brief network blip or a page reload without abandoning
+ * teammates for the rest of the round.
+ */
+export const RECONNECT_GRACE_MS = 10000;
+
 /* -------------------------------------------------------------------------- */
 /* World & server                                                             */
 /* -------------------------------------------------------------------------- */
@@ -268,3 +283,77 @@ export const AI_STALL_ENGAGE_MS = 450;
  * route fresh as the prey runs, without replanning every tick.
  */
 export const AI_REPATH_INTERVAL_MS = 700;
+
+
+/* -------------------------------------------------------------------------- */
+/* M7 · t7a snapshot wire                                                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Which encoding SNAPSHOT frames use on the wire (M7 · t7a/t7b). A shared
+ * constant so the client and server can never disagree about how to read a
+ * snapshot:
+ *
+ *   - `'binary'` — pack each snapshot into a quantized {@link ArrayBuffer} via
+ *     `encodeSnapshotBinary`/`decodeSnapshotBinary` (positions to 16-bit,
+ *     yaw/state/kind/stamina to bytes) and delta-compress it against the
+ *     client's last-ACKed baseline. This is the shipping path: snapshots drop
+ *     to a fraction of their JSON size.
+ *   - `'json'` — fall back to the original human-readable JSON `SnapshotMessage`
+ *     on BOTH sides, so a snapshot stream can be eyeballed while debugging.
+ *
+ * Only SNAPSHOT frames are affected; every other message stays JSON text.
+ */
+export const SNAPSHOT_WIRE: 'binary' | 'json' = 'binary';
+
+/**
+ * How many recently *sent* snapshots the server retains per client as candidate
+ * delta baselines, keyed by tick (M7 · t7b). When a client ACKs a snapshot tick
+ * still inside this window the server diffs the next frame against it; older
+ * baselines age out and force a fresh full snapshot. ~32 frames at
+ * {@link SNAPSHOT_RATE} is a couple of seconds of history — comfortably longer
+ * than any realistic ack round-trip, so late/dropped acks still land on a live
+ * baseline. The client keeps a slightly deeper history so the baseline the
+ * server picks is always present locally.
+ */
+export const SNAPSHOT_BASELINE_RING = 32;
+/* Interest management (M7 · t7c)                                             */
+/* -------------------------------------------------------------------------- */
+/*
+ * Per-client interest culling: a client is only sent the entities it could
+ * plausibly perceive, dropping everything on the far side of the town from its
+ * snapshot so bandwidth scales with what's *near* a player rather than the whole
+ * roster. Culling is a flat distance test on the XZ plane (ground plane) around
+ * the viewer; the viewer's own entity is never culled (the client needs its own
+ * authoritative state every snapshot for prediction/HUD).
+ *
+ * To stop an entity that hovers right at the boundary from flickering in and out
+ * of a client's snapshot each broadcast, the radius is a two-level band: an
+ * entity ENTERS interest at {@link INTEREST_RADIUS} and only EXITS once it
+ * recedes past {@link INTEREST_RADIUS} + {@link INTEREST_HYSTERESIS}. The dead
+ * band between the two is the hysteresis that gives stable enter/exit
+ * transitions (the same trick as the sprint {@link STAMINA_MIN_TO_SPRINT} gap).
+ */
+
+/**
+ * Radius (meters) at which an out-of-interest entity ENTERS a client's snapshot.
+ * Sized a touch above the NPC {@link AI_DETECTION_RADIUS} (34 m) so every entity
+ * that can currently affect the viewer's gameplay — anything close enough to
+ * chase, bat, infect, or be seen coming — is always transmitted, while the far
+ * side of the {@link MAP_SIZE} (128 m) town, which no client can perceive, is
+ * culled. With the outer band below this drops nothing within ~48 m yet still
+ * culls anything past the map's half-width (64 m).
+ */
+export const INTEREST_RADIUS = 40.0;
+
+/**
+ * Hysteresis gap (meters) added to {@link INTEREST_RADIUS} to form the OUTER
+ * exit radius: an already-visible entity is only culled once it passes
+ * `INTEREST_RADIUS + INTEREST_HYSTERESIS` (~48 m). The dead band between the
+ * inner enter radius and this outer exit radius means an entity jittering across
+ * the boundary — or a viewer strafing near it — doesn't pop the entity in and
+ * out of the snapshot every broadcast, which would otherwise flash its client
+ * rig each tick. ~8 m is comfortably wider than a snapshot's worth of movement
+ * even at {@link MOVE_SPEED_RUN}.
+ */
+export const INTEREST_HYSTERESIS = 8.0;

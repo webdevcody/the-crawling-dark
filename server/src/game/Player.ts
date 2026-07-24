@@ -1,5 +1,12 @@
 import type { WebSocket } from 'ws';
-import { createMoveState, STAMINA_MAX, type MoveState, type EntityKind } from '@crawling-dark/shared';
+import {
+  createMoveState,
+  STAMINA_MAX,
+  SNAPSHOT_BASELINE_RING,
+  type MoveState,
+  type EntityKind,
+  type EntitySnapshot,
+} from '@crawling-dark/shared';
 
 /**
  * Authoritative server-side model of one connected client (M3 · t3a/t3b/t3c).
@@ -41,11 +48,51 @@ export class Player {
    * The underlying `ws` socket used to push messages to this client, or `null`
    * for a server-spawned NPC (the M4 patient-zero zombie), which has no client
    * to talk to. {@link Room.send} skips any player whose socket is `null`.
+   *
+   * REBINDABLE (M7 · t7d): no longer `readonly`. On a reconnect the {@link Room}
+   * hands this player a brand-new socket (the fresh connection) in place of the
+   * dead one, so the *same* Player — id, team, position, combat state — keeps
+   * talking to the client over the new pipe. It is also nulled the moment a
+   * drop is detected (while the player sits in its grace window) so the server
+   * never tries to write to a closed socket.
    */
-  readonly socket: WebSocket | null;
+  socket: WebSocket | null;
 
   /** Display name claimed via {@link JoinMessage}; empty until a JOIN arrives. */
   name = '';
+
+  /* ---------------------------------------------------------------------- */
+  /* Reconnect / session (M7 · t7d)                                         */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Opaque, room-unique session token minted by the {@link Room} on first join
+   * and shipped in this player's {@link WelcomeMessage}. A later {@link
+   * JoinMessage} echoing this exact token lets the room reclaim this identity
+   * (rebind {@link socket}, keep id/team/position/combat) instead of spawning a
+   * new player. Empty string for the NPC, which has no client and never
+   * reconnects. Stays constant across a reconnect — the same token is re-issued.
+   */
+  token = '';
+
+  /**
+   * True while this player is inside its post-drop grace window: the socket has
+   * closed but the entity is deliberately kept in the world (so teammates still
+   * see it) awaiting a possible reconnect. While set, the {@link Room} freezes
+   * the player — {@link input} is zeroed so it stands idle rather than acting on
+   * the last held keys — and counts {@link graceMs} down each tick. Cleared when
+   * the client reconnects; if the timer instead reaches 0 the player is removed.
+   */
+  disconnected = false;
+
+  /**
+   * Remaining grace time in milliseconds while {@link disconnected} (0 = none
+   * pending). Seeded to {@link RECONNECT_GRACE_MS} on a detected drop and
+   * decremented by one {@link TICK_MS} per tick in lockstep with the sim, just
+   * like the combat timers. When it hits 0 without a reconnect the {@link Room}
+   * removes the player through the normal path so round/win logic sees it leave.
+   */
+  graceMs = 0;
 
   /**
    * Authoritative kinematic state (position, facing, vertical velocity, and the
@@ -59,6 +106,31 @@ export class Player {
 
   /** Highest input `seq` applied so far; echoed back per-recipient as snapshot `ack`. */
   lastSeq = 0;
+
+  /* ---------------------------------------------------------------------- */
+  /* Snapshot delta baseline (M7 · t7b)                                     */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Snapshot tick this client has confirmed fully applying, captured from
+   * {@link InputMessage.snapAck}. `undefined` until the first ack arrives (so
+   * the very first snapshot a client receives is always a FULL frame). The
+   * {@link Room} delta-encodes the next snapshot against {@link sentSnapshots}
+   * `[lastSnapAck]` whenever that tick is still in the ring. Monotonic — a
+   * stale/reordered ack never rolls the confirmed baseline backwards.
+   */
+  lastSnapAck?: number;
+
+  /**
+   * Ring of recently *sent* snapshots for THIS client, keyed by tick → the
+   * exact (already interest-culled) entity set that went out on that tick.
+   * Capped at {@link SNAPSHOT_BASELINE_RING} entries (oldest evicted first).
+   * When the client ACKs a tick still present here, that stored set is the
+   * baseline the next delta is diffed against — so a delta is only ever built
+   * against a frame the client is guaranteed to hold. See
+   * {@link recordSentSnapshot}.
+   */
+  readonly sentSnapshots = new Map<number, EntitySnapshot[]>();
 
   /**
    * True when this connection exceeded the active-player cap. Spectators still
@@ -103,6 +175,24 @@ export class Player {
    * flickering back on at the first regenerated tick.
    */
   exhausted = false;
+
+  /* ---------------------------------------------------------------------- */
+  /* Interest management (M7 · t7c)                                         */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Ids of the entities this connection was sent in its *last* snapshot — the
+   * viewer's currently-visible set for per-client interest culling (M7 · t7c).
+   * The {@link Room} feeds this into {@link cullByInterest} each broadcast and
+   * stores the returned set back here, which is what powers the enter/exit
+   * hysteresis: an entity already in this set holds interest out to the wider
+   * exit radius, so an entity hovering on the boundary doesn't flicker in and out
+   * of the snapshot tick to tick. Starts empty (a fresh viewer has seen nothing),
+   * and naturally sheds stale ids because it is rebuilt from the live entity list
+   * every broadcast. Unused for spectators and the NPC, whose snapshots bypass
+   * the cull entirely.
+   */
+  visibleEntities: Set<number> = new Set();
 
   /* ---------------------------------------------------------------------- */
   /* Combat & infection state (M3)                                          */
@@ -196,6 +286,22 @@ export class Player {
     this.spectator = spectator;
     this.isNpc = isNpc;
     this.move = createMoveState({ x, z });
+  }
+
+  /**
+   * Record the entity set just sent to this client on `tick` as a candidate
+   * delta baseline (M7 · t7b). A shallow copy is stored so a later rebuild of
+   * the source array can't corrupt the baseline; the entity objects themselves
+   * are immutable by construction (freshly built each broadcast). Evicts the
+   * oldest entry once the ring exceeds {@link SNAPSHOT_BASELINE_RING}.
+   */
+  recordSentSnapshot(tick: number, entities: readonly EntitySnapshot[]): void {
+    this.sentSnapshots.set(tick, entities.slice());
+    while (this.sentSnapshots.size > SNAPSHOT_BASELINE_RING) {
+      const oldest = this.sentSnapshots.keys().next().value;
+      if (oldest === undefined) break;
+      this.sentSnapshots.delete(oldest);
+    }
   }
 
   /** True while a stun timer is still running (bat-hit crowd control). */

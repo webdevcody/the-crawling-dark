@@ -5,5 +5,6 @@
 export * from './constants';
 export * from './types';
 export * from './protocol';
+export * from './wire';
 export * from './world';
 export * from './sim';
