@@ -48,6 +48,8 @@ import {
   addStreetLights,
 } from './scene/Atmosphere';
 import { HUD } from './ui/HUD';
+import { AudioEngine } from './audio/AudioEngine';
+import { AudioControls } from './ui/AudioControls';
 import type { InterpolatedEntity } from './net/Interpolation';
 
 const app = document.querySelector<HTMLDivElement>('#app') ?? document.body;
@@ -119,6 +121,23 @@ const controls = new Controls();
 controls.attachPointerLock(renderer.domElement);
 connection.connect();
 
+/* -------------------------------------------------------------------------- */
+/* Audio — procedural Web Audio (no assets); resumed on the first gesture       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The whole game's sound, synthesized with the Web Audio API (no bundled audio
+ * assets exist in this sandbox). The context can only start after a user
+ * gesture, so {@link AudioEngine.resume} + {@link AudioEngine.startAmbient} are
+ * called from the existing first-gesture hooks below (canvas mousedown, the `R`
+ * keydown, and the audio panel itself). It is fed the listener position each
+ * frame and triggered from gameplay events + the footstep driver in {@link animate}.
+ */
+const audio = new AudioEngine();
+
+/** Bottom-right mute/volume panel; also binds `M` to toggle mute. */
+const audioControls = new AudioControls(app, audio);
+
 /**
  * Client-side prediction for the LOCAL player (M6 · t6a). Fed this frame's input
  * immediately so our own body reacts without a round-trip, then corrected against
@@ -143,6 +162,11 @@ let lastReconciledTick: number | null = null;
  * middle buttons are ignored.
  */
 renderer.domElement.addEventListener('mousedown', (ev) => {
+  // First-gesture audio unlock: this fires on the very first canvas click (the
+  // click-to-lock one), before the pointer-lock guard below returns, so the
+  // AudioContext resumes and the ambient bed starts the moment play begins.
+  audio.resume();
+  audio.startAmbient();
   if (ev.button !== 0) return;
   if (!controls.pointerLocked) return;
   connection.sendAttack();
@@ -169,6 +193,10 @@ let localReady = false;
  */
 window.addEventListener('keydown', (ev) => {
   if (ev.code !== 'KeyR' || ev.repeat) return;
+  // Readying up in the lobby is a user gesture too — unlock audio here as well
+  // so a keyboard-only player who never clicks the canvas still gets sound.
+  audio.resume();
+  audio.startAmbient();
   localReady = !localReady;
   connection.sendReady(localReady);
 });
@@ -497,6 +525,58 @@ function onResize(): void {
 window.addEventListener('resize', onResize);
 
 /* -------------------------------------------------------------------------- */
+/* Footstep driver — a positional step per moving entity, on a speed cadence    */
+/* -------------------------------------------------------------------------- */
+
+/** Milliseconds between footsteps per movement state (run < walk < crawl). */
+const FOOTSTEP_INTERVAL_MS: Readonly<Record<'walk' | 'run' | 'crawl', number>> = {
+  walk: 430,
+  run: 300,
+  crawl: 640,
+};
+
+/**
+ * Per-entity footstep accumulators (ms of movement since the last step). Seeded
+ * with an id-derived phase so a crowd of walkers doesn't march in lock-step, and
+ * pruned as entities stop moving or leave.
+ */
+const footstepTimers = new Map<number, number>();
+
+/**
+ * Emit positional footsteps for every entity in a movement state, including the
+ * local player (also drawn from server state until prediction lands). Each
+ * entity accrues frame time and fires a step when it crosses its speed-dependent
+ * interval; the {@link AudioEngine} culls anything out of earshot, so distant
+ * hordes cost only the cheap bookkeeping here.
+ */
+function driveFootsteps(
+  entities: Map<number, InterpolatedEntity>,
+  dtMs: number,
+): void {
+  for (const entity of entities.values()) {
+    const s = entity.state;
+    if (s !== 'walk' && s !== 'run' && s !== 'crawl') {
+      footstepTimers.delete(entity.id);
+      continue;
+    }
+    const interval = FOOTSTEP_INTERVAL_MS[s];
+    // First sighting: start part-way through the cadence (id-derived phase) so
+    // steps land immediately and multiple movers stay out of phase.
+    let t = footstepTimers.get(entity.id) ?? (entity.id * 137) % interval;
+    t += dtMs;
+    if (t >= interval) {
+      audio.footstep(entity, s);
+      t -= interval;
+    }
+    footstepTimers.set(entity.id, t);
+  }
+  // Drop timers for entities that have left the world entirely.
+  for (const id of footstepTimers.keys()) {
+    if (!entities.has(id)) footstepTimers.delete(id);
+  }
+}
+
+/* -------------------------------------------------------------------------- */
 /* Render loop                                                                */
 /* -------------------------------------------------------------------------- */
 
@@ -557,23 +637,30 @@ function animate(): void {
     switch (ev.kind) {
       case 'attack': {
         const src = ev.actorId !== undefined ? entities.get(ev.actorId) : undefined;
-        spawnSwingVfx(
-          ev.x ?? src?.x ?? 0,
-          ev.y ?? src?.y ?? 0,
-          ev.z ?? src?.z ?? 0,
-          src?.yaw ?? 0,
-        );
+        const x = ev.x ?? src?.x ?? 0;
+        const y = ev.y ?? src?.y ?? 0;
+        const z = ev.z ?? src?.z ?? 0;
+        spawnSwingVfx(x, y, z, src?.yaw ?? 0);
+        audio.swing({ x, y, z }); // bat swing whoosh at the swinger
         break;
       }
       case 'stun': {
         const tgt = ev.targetId !== undefined ? entities.get(ev.targetId) : undefined;
-        spawnStunVfx(ev.x ?? tgt?.x ?? 0, ev.y ?? tgt?.y ?? 0, ev.z ?? tgt?.z ?? 0);
+        const x = ev.x ?? tgt?.x ?? 0;
+        const y = ev.y ?? tgt?.y ?? 0;
+        const z = ev.z ?? tgt?.z ?? 0;
+        spawnStunVfx(x, y, z);
+        audio.hit({ x, y, z }); // bat-hit impact at the victim
         pushFeedLine(`#${ev.actorId ?? '?'} stunned #${ev.targetId ?? '?'} 🦇`);
         break;
       }
       case 'infect': {
         const tgt = ev.targetId !== undefined ? entities.get(ev.targetId) : undefined;
-        spawnInfectVfx(ev.x ?? tgt?.x ?? 0, ev.y ?? tgt?.y ?? 0, ev.z ?? tgt?.z ?? 0);
+        const x = ev.x ?? tgt?.x ?? 0;
+        const y = ev.y ?? tgt?.y ?? 0;
+        const z = ev.z ?? tgt?.z ?? 0;
+        spawnInfectVfx(x, y, z);
+        audio.infect({ x, y, z }); // infection stinger at the victim
         pushFeedLine(`Player #${ev.targetId ?? '?'} was turned 🧟`);
         break;
       }
@@ -585,6 +672,14 @@ function animate(): void {
 
   // 5. Reconcile meshes with the interpolated world; get the local player's pos.
   const localFeet = syncEntities(entities, now);
+
+  // 5b. Audio: anchor the listener to the local player (facing = look yaw) and
+  //     drive positional footsteps for everyone moving. Skipped until we have a
+  //     local body, since positional panning/attenuation needs a reference point.
+  if (localFeet !== null) {
+    audio.setListener(localFeet, controls.yaw);
+    driveFootsteps(entities, dtMs);
+  }
 
   // 6. Advance transient combat VFX and the turn feed, culling the expired.
   updateEffects(dtMs);
@@ -628,4 +723,6 @@ window.addEventListener('beforeunload', () => {
   connection.close();
   controls.dispose();
   hud.dispose();
+  audioControls.dispose();
+  audio.dispose();
 });
