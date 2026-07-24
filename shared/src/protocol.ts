@@ -159,6 +159,15 @@ export interface InputMessage {
   yaw: number;
   /** Client frame delta in seconds (advisory; the server is authoritative). */
   dt: number;
+  /**
+   * Snapshot-ack (M7 · t7b): the `tick` of the most recent SNAPSHOT this client
+   * has fully applied. Piggy-backed on INPUT (which the client already streams
+   * every frame) so the server learns which snapshot the client is confirmed to
+   * hold and can delta-compress the next frame against that ACKed baseline.
+   * Additive and optional — omitted until the first snapshot lands, and ignored
+   * entirely while {@link SNAPSHOT_WIRE} is `'json'`.
+   */
+  snapAck?: number;
 }
 
 /** Request a bat swing. */

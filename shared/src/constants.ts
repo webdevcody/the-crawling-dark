@@ -268,3 +268,37 @@ export const AI_STALL_ENGAGE_MS = 450;
  * route fresh as the prey runs, without replanning every tick.
  */
 export const AI_REPATH_INTERVAL_MS = 700;
+
+
+/* -------------------------------------------------------------------------- */
+/* M7 · t7a snapshot wire                                                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Which encoding SNAPSHOT frames use on the wire (M7 · t7a/t7b). A shared
+ * constant so the client and server can never disagree about how to read a
+ * snapshot:
+ *
+ *   - `'binary'` — pack each snapshot into a quantized {@link ArrayBuffer} via
+ *     `encodeSnapshotBinary`/`decodeSnapshotBinary` (positions to 16-bit,
+ *     yaw/state/kind/stamina to bytes) and delta-compress it against the
+ *     client's last-ACKed baseline. This is the shipping path: snapshots drop
+ *     to a fraction of their JSON size.
+ *   - `'json'` — fall back to the original human-readable JSON `SnapshotMessage`
+ *     on BOTH sides, so a snapshot stream can be eyeballed while debugging.
+ *
+ * Only SNAPSHOT frames are affected; every other message stays JSON text.
+ */
+export const SNAPSHOT_WIRE: 'binary' | 'json' = 'binary';
+
+/**
+ * How many recently *sent* snapshots the server retains per client as candidate
+ * delta baselines, keyed by tick (M7 · t7b). When a client ACKs a snapshot tick
+ * still inside this window the server diffs the next frame against it; older
+ * baselines age out and force a fresh full snapshot. ~32 frames at
+ * {@link SNAPSHOT_RATE} is a couple of seconds of history — comfortably longer
+ * than any realistic ack round-trip, so late/dropped acks still land on a live
+ * baseline. The client keeps a slightly deeper history so the baseline the
+ * server picks is always present locally.
+ */
+export const SNAPSHOT_BASELINE_RING = 32;

@@ -1,5 +1,12 @@
 import type { WebSocket } from 'ws';
-import { createMoveState, STAMINA_MAX, type MoveState, type EntityKind } from '@crawling-dark/shared';
+import {
+  createMoveState,
+  STAMINA_MAX,
+  SNAPSHOT_BASELINE_RING,
+  type MoveState,
+  type EntityKind,
+  type EntitySnapshot,
+} from '@crawling-dark/shared';
 
 /**
  * Authoritative server-side model of one connected client (M3 · t3a/t3b/t3c).
@@ -59,6 +66,31 @@ export class Player {
 
   /** Highest input `seq` applied so far; echoed back per-recipient as snapshot `ack`. */
   lastSeq = 0;
+
+  /* ---------------------------------------------------------------------- */
+  /* Snapshot delta baseline (M7 · t7b)                                     */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Snapshot tick this client has confirmed fully applying, captured from
+   * {@link InputMessage.snapAck}. `undefined` until the first ack arrives (so
+   * the very first snapshot a client receives is always a FULL frame). The
+   * {@link Room} delta-encodes the next snapshot against {@link sentSnapshots}
+   * `[lastSnapAck]` whenever that tick is still in the ring. Monotonic — a
+   * stale/reordered ack never rolls the confirmed baseline backwards.
+   */
+  lastSnapAck?: number;
+
+  /**
+   * Ring of recently *sent* snapshots for THIS client, keyed by tick → the
+   * exact (already interest-culled) entity set that went out on that tick.
+   * Capped at {@link SNAPSHOT_BASELINE_RING} entries (oldest evicted first).
+   * When the client ACKs a tick still present here, that stored set is the
+   * baseline the next delta is diffed against — so a delta is only ever built
+   * against a frame the client is guaranteed to hold. See
+   * {@link recordSentSnapshot}.
+   */
+  readonly sentSnapshots = new Map<number, EntitySnapshot[]>();
 
   /**
    * True when this connection exceeded the active-player cap. Spectators still
@@ -196,6 +228,22 @@ export class Player {
     this.spectator = spectator;
     this.isNpc = isNpc;
     this.move = createMoveState({ x, z });
+  }
+
+  /**
+   * Record the entity set just sent to this client on `tick` as a candidate
+   * delta baseline (M7 · t7b). A shallow copy is stored so a later rebuild of
+   * the source array can't corrupt the baseline; the entity objects themselves
+   * are immutable by construction (freshly built each broadcast). Evicts the
+   * oldest entry once the ring exceeds {@link SNAPSHOT_BASELINE_RING}.
+   */
+  recordSentSnapshot(tick: number, entities: readonly EntitySnapshot[]): void {
+    this.sentSnapshots.set(tick, entities.slice());
+    while (this.sentSnapshots.size > SNAPSHOT_BASELINE_RING) {
+      const oldest = this.sentSnapshots.keys().next().value;
+      if (oldest === undefined) break;
+      this.sentSnapshots.delete(oldest);
+    }
   }
 
   /** True while a stun timer is still running (bat-hit crowd control). */
