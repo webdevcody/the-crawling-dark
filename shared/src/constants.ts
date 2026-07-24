@@ -69,6 +69,43 @@ export const PLAYER_HEIGHT = 1.8;
 export const CRAWL_HEIGHT = 0.9;
 
 /* -------------------------------------------------------------------------- */
+/* Stamina / sprint (M6 · t6b)                                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Full stamina reserve, as a unitless fraction. Stamina is tracked in
+ * `[0, STAMINA_MAX]` (1 = rested, 0 = spent) so it maps one-to-one onto both the
+ * HUD bar's fill fraction and the {@link EntitySnapshot.stamina} wire field with
+ * no scaling on either side.
+ */
+export const STAMINA_MAX = 1;
+
+/**
+ * Stamina drained per second of *actual* sprinting — the {@link InputKey.Run}
+ * bit held while genuinely moving on the ground (not crawling, not exhausted).
+ * At {@link STAMINA_MAX} this empties a full bar in ≈3 s, keeping a sprint a
+ * short committed burst rather than a free permanent speed-up (DESIGN §M6).
+ */
+export const STAMINA_DRAIN_PER_SEC = 0.34;
+
+/**
+ * Stamina recovered per second whenever NOT sprinting (walking, crawling, idle,
+ * airborne, stunned, …). Deliberately gentler than {@link STAMINA_DRAIN_PER_SEC}
+ * — a full refill takes ≈5–6 s — so sprint carries a real recovery cost and
+ * can't be feathered on and off for free.
+ */
+export const STAMINA_REGEN_PER_SEC = 0.18;
+
+/**
+ * Sprint re-enable threshold after exhaustion. The instant stamina hits 0 the
+ * runner is latched "exhausted" and pinned to walk speed; sprint only re-enables
+ * once stamina has regenerated back up to this fraction. The hysteresis gap
+ * between 0 and this value stops a drained player from stutter-sprinting one
+ * tick at a time the moment the bar leaves empty.
+ */
+export const STAMINA_MIN_TO_SPRINT = 0.2;
+
+/* -------------------------------------------------------------------------- */
 /* Combat & infection                                                         */
 /* -------------------------------------------------------------------------- */
 

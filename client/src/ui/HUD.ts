@@ -27,6 +27,7 @@
 
 import {
   MIN_PLAYERS_TO_START,
+  STAMINA_MIN_TO_SPRINT,
   type EntityKind,
   type RoundMessage,
 } from '@crawling-dark/shared';
@@ -54,6 +55,12 @@ export interface HudState {
   tick: number;
   /** The local player's team (from its entity `kind`), or `null` if not spawned. */
   team: EntityKind | null;
+  /**
+   * The local player's server-authoritative stamina fraction (0..1), or `null`
+   * before we spawn / while spectating. The bar renders empty & neutral for
+   * `null` and mirrors this value exactly otherwise.
+   */
+  stamina: number | null;
   /** Whether the local player has toggled ready in the lobby. */
   ready: boolean;
   /** Pointer-look hint string (reused from main's `lookHint` logic). */
@@ -128,6 +135,10 @@ export class HUD {
   private readonly zombiesValue: HTMLSpanElement;
   private readonly tickValue: HTMLSpanElement;
   private readonly rttValue: HTMLSpanElement;
+  /** Fixed-width stamina bar track; its {@link staminaFill} child shows the level. */
+  private readonly staminaTrack: HTMLSpanElement;
+  /** The stamina bar's fill — width follows the fraction, color flags "low". */
+  private readonly staminaFill: HTMLSpanElement;
   private readonly readyHint: HTMLSpanElement;
   private readonly lookHint: HTMLSpanElement;
 
@@ -166,7 +177,7 @@ export class HUD {
     this.statusDot = document.createElement('span');
     this.statusDot.textContent = '● ';
     const title = document.createElement('b');
-    title.textContent = 'The Crawling Dark · M5';
+    title.textContent = 'The Crawling Dark · M6';
     header.append(this.statusDot, title);
     this.panel.append(header);
 
@@ -185,6 +196,34 @@ export class HUD {
     this.panel.append(scoreRow);
     this.tickValue = this.addRow('tick');
     this.rttValue = this.addRow('rtt');
+
+    // Stamina bar row: a fixed-width track holding a fill whose width tracks the
+    // authoritative stamina fraction. Built ONCE here; `update` only resizes and
+    // recolors the fill, never re-parents anything.
+    const staminaRow = document.createElement('div');
+    this.staminaTrack = document.createElement('span');
+    Object.assign(this.staminaTrack.style, {
+      display: 'inline-block',
+      verticalAlign: 'middle',
+      width: '120px',
+      height: '8px',
+      background: 'rgba(58, 90, 106, 0.35)',
+      border: '1px solid rgba(58, 90, 106, 0.6)',
+      borderRadius: '4px',
+      overflow: 'hidden',
+    } satisfies Partial<CSSStyleDeclaration>);
+    this.staminaFill = document.createElement('span');
+    Object.assign(this.staminaFill.style, {
+      display: 'block',
+      height: '100%',
+      width: '100%',
+      background: GREEN,
+      transition: 'width 80ms linear',
+    } satisfies Partial<CSSStyleDeclaration>);
+    this.staminaTrack.append(this.staminaFill);
+    staminaRow.append(HUD.makeLabel('stamina'), this.staminaTrack);
+    this.panel.append(staminaRow);
+
     this.addStatic('move', 'WASD · Shift run · C crawl · Space jump');
     this.addStatic('combat', 'Left-click: swing bat');
     this.readyHint = this.addRow('ready');
@@ -296,6 +335,20 @@ export class HUD {
     this.tickValue.textContent = String(state.tick);
     this.rttValue.textContent =
       state.rttMs > 0 ? `${Math.round(state.rttMs)} ms` : '—';
+
+    // Stamina bar — mirror the authoritative fraction exactly: width = fraction,
+    // amber while below the sprint-enable threshold (i.e. exhausted / recovering,
+    // sprint locked out) and green once sprint is available again. With no local
+    // stamina (pre-spawn / spectating) show an empty, neutral track.
+    const { stamina } = state;
+    if (stamina === null) {
+      this.staminaFill.style.width = '0%';
+      this.staminaFill.style.background = DIM;
+    } else {
+      const frac = Math.max(0, Math.min(1, stamina));
+      this.staminaFill.style.width = `${frac * 100}%`;
+      this.staminaFill.style.background = frac < STAMINA_MIN_TO_SPRINT ? AMBER : GREEN;
+    }
 
     // `R: ready` hint — reflects your live ready state while in the lobby, and
     // reads as a plain hint the rest of the time (readiness only matters there).

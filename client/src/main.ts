@@ -1,5 +1,5 @@
 /**
- * The Crawling Dark — client entry point (M3 · Combat & Infection demo).
+ * The Crawling Dark — client entry point (M6 · Prediction & Polish).
  *
  * Wires the M2 systems into a playable third-person scene:
  *   - the seeded town ({@link buildTown}) rendered from the same {@link World}
@@ -8,8 +8,8 @@
  *     frames (held-key bitmask + look yaw) streamed every frame;
  *   - a third-person spring-arm follow camera ({@link FollowCamera}) that trails
  *     the local player and retracts around walls;
- *   - remote (and local) entities rendered from interpolated snapshots
- *     (~INTERP_BUFFER_MS in the past) so everyone moves smoothly.
+ *   - remote entities rendered from interpolated snapshots (~INTERP_BUFFER_MS in
+ *     the past) so everyone moves smoothly; the LOCAL player is client-predicted.
  *
  * M3 (t3d) layers combat on top: left-click sends an ATTACK; bodies are colored
  * by team (human vs zombie) and repaint the instant an infection flips a body's
@@ -24,26 +24,36 @@
  * (streamed via {@link Connection.sendReady}); the flag resets whenever the
  * round returns to `lobby`, matching the server clearing readiness on reset.
  *
- * There is no client-side prediction yet — the local player is also drawn from
- * interpolated server state, so it lags input slightly. Prediction/reconciliation
- * is M6 (t6a); until then this is the interpolation-only MVP the design calls for.
+ * M6 makes it feel good: the local player is now client-predicted + reconciled
+ * ({@link Predictor}, t6a) so it responds instantly; entities are drawn as rigged,
+ * animated {@link Character} rigs (t6c); the HUD shows a server-authoritative
+ * stamina bar (t6b); a procedural {@link AudioEngine} adds footsteps, combat SFX,
+ * and a dark-town ambient bed (t6d); and the mood pass — one shadow-casting moon,
+ * close fog, and warm street lamps ({@link createAtmosphere}, t6e) — sells the
+ * crawling dark.
  */
 
 import * as THREE from 'three';
 import {
   MAP_SIZE,
-  PLAYER_RADIUS,
-  PLAYER_HEIGHT,
-  CRAWL_HEIGHT,
   generateWorld,
   type World,
   type EntityKind,
 } from '@crawling-dark/shared';
 import { Connection } from './net/Connection';
+import { Predictor } from './predict/Predictor';
 import { Controls } from './input/Controls';
 import { FollowCamera } from './scene/FollowCamera';
 import { buildTown } from './scene/TownView';
+import { Character } from './entities/Character';
+import {
+  configureRenderer,
+  createAtmosphere,
+  addStreetLights,
+} from './scene/Atmosphere';
 import { HUD } from './ui/HUD';
+import { AudioEngine } from './audio/AudioEngine';
+import { AudioControls } from './ui/AudioControls';
 import type { InterpolatedEntity } from './net/Interpolation';
 
 const app = document.querySelector<HTMLDivElement>('#app') ?? document.body;
@@ -55,6 +65,8 @@ const app = document.querySelector<HTMLDivElement>('#app') ?? document.body;
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+// M6 (t6e): enable the moon's soft shadow map (see Atmosphere.ts).
+configureRenderer(renderer);
 app.appendChild(renderer.domElement);
 
 /* -------------------------------------------------------------------------- */
@@ -62,10 +74,10 @@ app.appendChild(renderer.domElement);
 /* -------------------------------------------------------------------------- */
 
 const scene = new THREE.Scene();
-const DARK = new THREE.Color(0x05070a);
-scene.background = DARK;
-// Linear fog so distant geometry dissolves into the crawling dark.
-scene.fog = new THREE.Fog(DARK, MAP_SIZE * 0.12, MAP_SIZE * 0.9);
+// M6 (t6e): the whole mood pass — near-black background + close tense fog, one
+// dim cool ambient, and the single shadow-casting moon — lives in Atmosphere.ts.
+// This replaces the former inline background/fog and the ambient/moon block below.
+createAtmosphere(scene);
 
 /* -------------------------------------------------------------------------- */
 /* Camera — third-person spring-arm follow (starts at a gentle overview)      */
@@ -105,19 +117,6 @@ grid.position.y = 0.01;
 scene.add(grid);
 
 /* -------------------------------------------------------------------------- */
-/* Lighting                                                                   */
-/* -------------------------------------------------------------------------- */
-
-const ambient = new THREE.AmbientLight(0x2a3846, 0.5);
-scene.add(ambient);
-
-const moon = new THREE.DirectionalLight(0xa9c7ff, 1.0);
-moon.position.set(MAP_SIZE * 0.3, MAP_SIZE * 0.6, MAP_SIZE * 0.2);
-moon.target.position.set(0, 0, 0);
-scene.add(moon);
-scene.add(moon.target);
-
-/* -------------------------------------------------------------------------- */
 /* Networking + input                                                         */
 /* -------------------------------------------------------------------------- */
 
@@ -125,6 +124,38 @@ const connection = new Connection();
 const controls = new Controls();
 controls.attachPointerLock(renderer.domElement);
 connection.connect();
+
+/* -------------------------------------------------------------------------- */
+/* Audio — procedural Web Audio (no assets); resumed on the first gesture       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The whole game's sound, synthesized with the Web Audio API (no bundled audio
+ * assets exist in this sandbox). The context can only start after a user
+ * gesture, so {@link AudioEngine.resume} + {@link AudioEngine.startAmbient} are
+ * called from the existing first-gesture hooks below (canvas mousedown, the `R`
+ * keydown, and the audio panel itself). It is fed the listener position each
+ * frame and triggered from gameplay events + the footstep driver in {@link animate}.
+ */
+const audio = new AudioEngine();
+
+/** Bottom-right mute/volume panel; also binds `M` to toggle mute. */
+const audioControls = new AudioControls(app, audio);
+
+/**
+ * Client-side prediction for the LOCAL player (M6 · t6a). Fed this frame's input
+ * immediately so our own body reacts without a round-trip, then corrected against
+ * each authoritative snapshot. Remote entities are untouched — they keep flowing
+ * through the interpolator (see {@link Predictor}).
+ */
+const predictor = new Predictor();
+
+/**
+ * Server tick of the last snapshot we reconciled against, so we reconcile exactly
+ * once per new snapshot (the tick strictly increases between snapshots). `null`
+ * until the first reconcile lands.
+ */
+let lastReconciledTick: number | null = null;
 
 /**
  * Left-click to swing the bat. Pointer lock is requested by Controls on the
@@ -135,6 +166,11 @@ connection.connect();
  * middle buttons are ignored.
  */
 renderer.domElement.addEventListener('mousedown', (ev) => {
+  // First-gesture audio unlock: this fires on the very first canvas click (the
+  // click-to-lock one), before the pointer-lock guard below returns, so the
+  // AudioContext resumes and the ambient bed starts the moment play begins.
+  audio.resume();
+  audio.startAmbient();
   if (ev.button !== 0) return;
   if (!controls.pointerLocked) return;
   connection.sendAttack();
@@ -161,6 +197,10 @@ let localReady = false;
  */
 window.addEventListener('keydown', (ev) => {
   if (ev.code !== 'KeyR' || ev.repeat) return;
+  // Readying up in the lobby is a user gesture too — unlock audio here as well
+  // so a keyboard-only player who never clicks the canvas still gets sound.
+  audio.resume();
+  audio.startAmbient();
   localReady = !localReady;
   connection.sendReady(localReady);
 });
@@ -182,196 +222,39 @@ function ensureWorld(): void {
   if (seed === null) return;
   world = generateWorld(seed);
   scene.add(buildTown(world));
+  // M6 (t6e): warm sodium lamp posts along the streets, now that the town exists.
+  addStreetLights(scene, world);
 }
 
 /* -------------------------------------------------------------------------- */
-/* Entity meshes — reconciled against interpolated snapshots each frame        */
+/* Entity characters — reconciled against interpolated snapshots each frame     */
 /* -------------------------------------------------------------------------- */
 
-/** Unit-height player box (footprint = collision diameter); scaled per-frame by profile. */
-const PLAYER_GEOMETRY = new THREE.BoxGeometry(
-  PLAYER_RADIUS * 2,
-  1,
-  PLAYER_RADIUS * 2,
-);
-
-/** Highlight color for the local player (human) so you can tell which body is you. */
-const LOCAL_COLOR = new THREE.Color(0x53ffa8);
-
 /**
- * The LOCAL player's zombie tint — a toxic, self-lit green. Combined with the
- * strong emissive glow every local body carries, it keeps "you" unmistakable
- * even after turning, while still visibly reading as the zombie team.
+ * Live character rigs keyed by entity id, mirroring the interpolated entity set.
+ * Each {@link Character} is an articulated humanoid built behind the
+ * {@link CharacterModel} seam (see `entities/Character.ts`), so the box-per-body
+ * renderer this replaced — and, later, a GLTF/AnimationMixer body — can be
+ * swapped in without touching the reconciliation loop below.
  */
-const LOCAL_ZOMBIE_COLOR = new THREE.Color(0x9dff2f);
-
-/** Electric-yellow tint layered onto a body's emissive while it is stunned. */
-const STUN_TINT = new THREE.Color(0xffe14a);
-
-/** How far a downed body's color is dimmed toward black in the death-cam. */
-const DOWN_DIM = 0.32;
-
-/** Live meshes keyed by entity id, mirroring the interpolated entity set. */
-const meshes = new Map<number, THREE.Mesh>();
-
-/** Deterministic, well-spread color from an entity id (golden-ratio hue). */
-function colorForId(id: number): THREE.Color {
-  const hue = (id * 0.61803398875) % 1;
-  return new THREE.Color().setHSL(hue, 0.6, 0.55);
-}
+const characters = new Map<number, Character>();
 
 /**
- * Desaturated, sickly green/olive for a zombie body. A slight per-id hue jitter
- * keeps a horde from reading as one flat blob while staying firmly in the
- * "infected" palette so zombies never look like the bright human colors.
+ * `performance.now()` of the previous {@link syncEntities} call, used to derive a
+ * per-frame delta for the rigs (the procedural animation is time-based off
+ * `nowMs` and ignores it, but the seam passes it through for a future
+ * `AnimationMixer.update`). Kept here so {@link syncEntities} can preserve its
+ * exact `(entities, nowMs)` signature — no dt parameter is added to it.
  */
-function zombieColorForId(id: number): THREE.Color {
-  const hue = 0.26 + ((id * 0.61803398875) % 1) * 0.06; // narrow green/olive band
-  return new THREE.Color().setHSL(hue, 0.32, 0.3);
-}
+let lastCharNowMs = 0;
 
 /**
- * Paint an entity's material for its TEAM and cache the resulting "base" colors
- * on the mesh (`userData.baseColor` / `userData.baseEmissive`), so the per-frame
- * state overlay in {@link applyEntityState} can always start from a clean team
- * look. Called on spawn and again whenever an entity's `kind` flips (a human
- * turning into a zombie — same id), which is what makes an infection visibly
- * recolor the body mid-round.
- *
- * The LOCAL player is kept self-lit (a strong emissive glow) so you can always
- * pick yourself out of a crowd; its base hue still tracks your team (spring
- * green as a human -> toxic green as a zombie) so your own turn is visible too.
- */
-function applyTeamMaterial(
-  mesh: THREE.Mesh,
-  isLocal: boolean,
-  kind: EntityKind,
-): void {
-  const material = mesh.material as THREE.MeshStandardMaterial;
-  const base = mesh.userData.baseColor as THREE.Color;
-  const baseEmissive = mesh.userData.baseEmissive as THREE.Color;
-  const id = mesh.userData.entityId as number;
-
-  if (isLocal) {
-    base.copy(kind === 'zombie' ? LOCAL_ZOMBIE_COLOR : LOCAL_COLOR);
-    // Strong self-glow marks "you" regardless of team.
-    baseEmissive.copy(base).multiplyScalar(0.3);
-  } else if (kind === 'zombie') {
-    base.copy(zombieColorForId(id));
-    // Faint sickly glow so zombies read as "infected" even in shadow.
-    baseEmissive.setHex(0x142808);
-  } else {
-    base.copy(colorForId(id));
-    baseEmissive.setHex(0x000000);
-  }
-
-  material.color.copy(base);
-  material.emissive.copy(baseEmissive);
-  mesh.userData.kind = kind;
-}
-
-/** Create (once) the mesh for an entity, paint it for its team, and add it. */
-function createMesh(id: number, isLocal: boolean, kind: EntityKind): THREE.Mesh {
-  const material = new THREE.MeshStandardMaterial({
-    roughness: 0.5,
-    metalness: 0.1,
-  });
-  const mesh = new THREE.Mesh(PLAYER_GEOMETRY, material);
-  mesh.castShadow = true;
-  // Cache identity + reusable base-color scratch so we never re-allocate Colors
-  // per frame; the team paint fills them in below.
-  mesh.userData.entityId = id;
-  mesh.userData.baseColor = new THREE.Color();
-  mesh.userData.baseEmissive = new THREE.Color();
-  applyTeamMaterial(mesh, isLocal, kind);
-  scene.add(mesh);
-  meshes.set(id, mesh);
-  return mesh;
-}
-
-/**
- * Apply one frame of an entity's transform + material for its movement/combat
- * `state`. Every value is *assigned* (never accumulated) from the cached team
- * base, so a state ending automatically restores the body next frame:
- *
- *   - `crawl` -> low profile;  `down` -> a dim, flattened pancake on the ground
- *     (the death-cam pose);
- *   - `attack` -> a quick forward lunge + emissive pop that sells the swing
- *     (paired with the arc VFX spawned from the matching event);
- *   - `stun` -> jitter-in-place, a little wobble, and an electric-yellow tint.
- *
- * `nowMs` (a {@link performance.now} reading) drives the time-based stun shake.
- */
-function applyEntityState(
-  mesh: THREE.Mesh,
-  entity: InterpolatedEntity,
-  nowMs: number,
-): void {
-  const material = mesh.material as THREE.MeshStandardMaterial;
-  const base = mesh.userData.baseColor as THREE.Color;
-  const baseEmissive = mesh.userData.baseEmissive as THREE.Color;
-
-  // Start from the clean team look; overlays below tint on top of it.
-  material.color.copy(base);
-  material.emissive.copy(baseEmissive);
-
-  // Body profile + pose scratch, defaulted to a standing (or crawling) box.
-  let sx = 1;
-  let sy = entity.state === 'crawl' ? CRAWL_HEIGHT : PLAYER_HEIGHT;
-  let sz = 1;
-  let rotX = 0;
-  let rotZ = 0;
-  let dx = 0;
-  let dz = 0;
-  let yaw = entity.yaw;
-
-  switch (entity.state) {
-    case 'attack': {
-      // Lunge forward and thrust the box out along its facing.
-      rotX = -0.35;
-      sz = 1.25;
-      material.emissive.copy(base).multiplyScalar(0.45);
-      break;
-    }
-    case 'stun': {
-      // Rattled: a time-driven shake + wobble, tinted electric yellow.
-      const t = nowMs * 0.03;
-      dx = Math.sin(t) * 0.08;
-      dz = Math.cos(t * 1.3) * 0.08;
-      yaw += Math.sin(t * 0.7) * 0.25;
-      rotZ = Math.sin(t * 1.1) * 0.12;
-      material.emissive.copy(baseEmissive).lerp(STUN_TINT, 0.75);
-      break;
-    }
-    case 'down': {
-      // Death-cam: a dim pancake resting on the ground.
-      sx = 1.35;
-      sy = 0.2;
-      sz = 1.35;
-      material.color.copy(base).multiplyScalar(DOWN_DIM);
-      material.emissive.setHex(0x000000);
-      break;
-    }
-    default:
-      break;
-  }
-
-  mesh.scale.set(sx, sy, sz);
-  // `entity.y` is feet height (0 on the ground, >0 mid-jump); the box is
-  // centered, so lift it by half its scaled height to rest the base there.
-  // The stun shake nudges x/z only, never the resting height.
-  mesh.position.set(entity.x + dx, entity.y + sy / 2, entity.z + dz);
-  // rotation.order stays the default 'XYZ'; yaw is the dominant term.
-  mesh.rotation.set(rotX, yaw, rotZ);
-}
-
-/**
- * Reconcile Three.js meshes with the interpolated entity set: spawn new bodies,
- * repaint any whose team (`kind`) flipped this frame, drive their combat pose
- * via {@link applyEntityState}, and dispose meshes for entities that have left.
+ * Reconcile character rigs with the interpolated entity set: spawn new bodies,
+ * recolor any whose team (`kind`) flipped this frame, drive their movement/combat
+ * pose via {@link Character.update}, and dispose rigs for entities that have left.
  * Returns the local player's feet position for the follow camera, or `null` if
  * the local entity isn't present. `nowMs` (a {@link performance.now} reading)
- * feeds the stun animation.
+ * drives the time-based animation.
  */
 function syncEntities(
   entities: Map<number, InterpolatedEntity>,
@@ -380,30 +263,41 @@ function syncEntities(
   const localId = connection.playerId;
   let localFeet: { x: number; y: number; z: number } | null = null;
 
+  // Frame delta for the rigs, clamped so a stalled tab can't fling the pose.
+  const dtMs = lastCharNowMs === 0 ? 0 : Math.min(100, Math.max(0, nowMs - lastCharNowMs));
+  lastCharNowMs = nowMs;
+
   for (const entity of entities.values()) {
     const isLocal = entity.id === localId;
-    const mesh =
-      meshes.get(entity.id) ?? createMesh(entity.id, isLocal, entity.kind);
 
-    // A human turning into a zombie keeps its id but changes `kind`; repaint the
-    // body (and its cached base colors) the instant that flip is observed so the
-    // infection is visible.
-    if (mesh.userData.kind !== entity.kind) {
-      applyTeamMaterial(mesh, isLocal, entity.kind);
+    let character = characters.get(entity.id);
+    if (character === undefined) {
+      character = new Character(entity.id);
+      character.setTeam(entity.kind, isLocal);
+      scene.add(character.root);
+      characters.set(entity.id, character);
+    } else if (character.kind !== entity.kind) {
+      // A human turning into a zombie keeps its id but changes `kind`; recolor
+      // (and reshape) the body the instant that flip is observed so the
+      // infection is visible.
+      character.setTeam(entity.kind, isLocal);
     }
 
-    applyEntityState(mesh, entity, nowMs);
+    // `root` origin is at the feet, so the entity's `{x, y, z}` (feet height,
+    // >0 mid-jump) places the body directly; facing + pose are applied inside.
+    character.root.position.set(entity.x, entity.y, entity.z);
+    character.update(entity.state, entity.yaw, nowMs, dtMs);
 
     if (isLocal) localFeet = { x: entity.x, y: entity.y, z: entity.z };
   }
 
-  // Remove departed entities. Only the per-entity MATERIAL is disposed — the
-  // shared PLAYER_GEOMETRY is reused by every body and must never be disposed.
-  for (const [id, mesh] of meshes) {
+  // Remove departed entities, disposing each rig's owned material. The shared
+  // limb geometries live in `Character.ts` and are never disposed here.
+  for (const [id, character] of characters) {
     if (!entities.has(id)) {
-      scene.remove(mesh);
-      (mesh.material as THREE.Material).dispose();
-      meshes.delete(id);
+      scene.remove(character.root);
+      character.dispose();
+      characters.delete(id);
     }
   }
 
@@ -417,8 +311,8 @@ function syncEntities(
 /**
  * One live visual effect: a throwaway mesh that grows and/or spins as it ages
  * and fades out over its lifetime, after which it is removed and its geometry +
- * material are disposed. Each effect owns UNIQUE geometry, so disposal can never
- * touch the shared PLAYER_GEOMETRY. {@link updateEffects} advances the pool.
+ * material are disposed. Each effect owns UNIQUE geometry (never a shared one), so
+ * its disposal is always self-contained. {@link updateEffects} advances the pool.
  */
 interface Effect {
   mesh: THREE.Mesh;
@@ -612,6 +506,17 @@ function localTeam(entities: Map<number, InterpolatedEntity>): EntityKind | null
   return me ? me.kind : null;
 }
 
+/**
+ * Resolve the local player's server-authoritative stamina fraction (0..1) from
+ * its interpolated entity, or `null` if we haven't spawned yet (pre-WELCOME, or
+ * spectating). The HUD draws an empty, neutral bar for `null`.
+ */
+function localStamina(entities: Map<number, InterpolatedEntity>): number | null {
+  const localId = connection.playerId;
+  const me = localId !== null ? entities.get(localId) : undefined;
+  return me ? me.stamina : null;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Resize handling                                                            */
 /* -------------------------------------------------------------------------- */
@@ -624,6 +529,58 @@ function onResize(): void {
 window.addEventListener('resize', onResize);
 
 /* -------------------------------------------------------------------------- */
+/* Footstep driver — a positional step per moving entity, on a speed cadence    */
+/* -------------------------------------------------------------------------- */
+
+/** Milliseconds between footsteps per movement state (run < walk < crawl). */
+const FOOTSTEP_INTERVAL_MS: Readonly<Record<'walk' | 'run' | 'crawl', number>> = {
+  walk: 430,
+  run: 300,
+  crawl: 640,
+};
+
+/**
+ * Per-entity footstep accumulators (ms of movement since the last step). Seeded
+ * with an id-derived phase so a crowd of walkers doesn't march in lock-step, and
+ * pruned as entities stop moving or leave.
+ */
+const footstepTimers = new Map<number, number>();
+
+/**
+ * Emit positional footsteps for every entity in a movement state, including the
+ * local player (also drawn from server state until prediction lands). Each
+ * entity accrues frame time and fires a step when it crosses its speed-dependent
+ * interval; the {@link AudioEngine} culls anything out of earshot, so distant
+ * hordes cost only the cheap bookkeeping here.
+ */
+function driveFootsteps(
+  entities: Map<number, InterpolatedEntity>,
+  dtMs: number,
+): void {
+  for (const entity of entities.values()) {
+    const s = entity.state;
+    if (s !== 'walk' && s !== 'run' && s !== 'crawl') {
+      footstepTimers.delete(entity.id);
+      continue;
+    }
+    const interval = FOOTSTEP_INTERVAL_MS[s];
+    // First sighting: start part-way through the cadence (id-derived phase) so
+    // steps land immediately and multiple movers stay out of phase.
+    let t = footstepTimers.get(entity.id) ?? (entity.id * 137) % interval;
+    t += dtMs;
+    if (t >= interval) {
+      audio.footstep(entity, s);
+      t -= interval;
+    }
+    footstepTimers.set(entity.id, t);
+  }
+  // Drop timers for entities that have left the world entirely.
+  for (const id of footstepTimers.keys()) {
+    if (!entities.has(id)) footstepTimers.delete(id);
+  }
+}
+
+/* -------------------------------------------------------------------------- */
 /* Render loop                                                                */
 /* -------------------------------------------------------------------------- */
 
@@ -634,14 +591,49 @@ function animate(): void {
   const dtMs = dt * 1000;
   const now = performance.now();
 
-  // 1. Push this frame's input (held-key bitmask + look yaw) to the server.
-  connection.sendInput(controls.keys, dt, controls.yaw);
+  // 1. Push this frame's input (held-key bitmask + look yaw) to the server,
+  //    capturing the seq so the local predictor can key its input history by it.
+  const seq = connection.sendInput(controls.keys, dt, controls.yaw);
 
   // 2. Build the town once we know the seed.
   ensureWorld();
 
+  // 2b. Mirror this frame's input into the local predictor so our own body moves
+  //     instantly (needs the town for the same XZ collision the server applies).
+  if (world !== null) {
+    predictor.record(seq, controls.keys, controls.yaw, dt, world);
+  }
+
   // 3. Sample the interpolated world once; reused for events, meshes, and HUD.
   const entities = connection.sampleEntities(now);
+
+  // 3b. Reconcile the predictor once per new authoritative snapshot: snap onto the
+  //     server's local-player state, drop acked inputs, replay the unacked tail.
+  if (
+    world !== null &&
+    connection.playerId !== null &&
+    connection.tick !== lastReconciledTick
+  ) {
+    const serverLocal = connection.entities.get(connection.playerId);
+    if (serverLocal !== undefined) {
+      predictor.reconcile(serverLocal, connection.ack, world);
+      lastReconciledTick = connection.tick;
+    }
+  }
+
+  // 3c. Render override (upstream of syncEntities so that module stays decoupled):
+  //     replace ONLY the local entity's transform with the predicted values,
+  //     leaving its kind/state — and every remote entity — interpolated as before.
+  if (predictor.hasBase && connection.playerId !== null) {
+    const me = entities.get(connection.playerId);
+    if (me !== undefined) {
+      const p = predictor.predicted;
+      me.x = p.x;
+      me.y = p.y;
+      me.z = p.z;
+      me.yaw = p.yaw;
+    }
+  }
 
   // 4. Turn this frame's server events into VFX + turn-feed lines. Positions
   //    fall back to the actor/target entity when an event omits coordinates.
@@ -649,23 +641,30 @@ function animate(): void {
     switch (ev.kind) {
       case 'attack': {
         const src = ev.actorId !== undefined ? entities.get(ev.actorId) : undefined;
-        spawnSwingVfx(
-          ev.x ?? src?.x ?? 0,
-          ev.y ?? src?.y ?? 0,
-          ev.z ?? src?.z ?? 0,
-          src?.yaw ?? 0,
-        );
+        const x = ev.x ?? src?.x ?? 0;
+        const y = ev.y ?? src?.y ?? 0;
+        const z = ev.z ?? src?.z ?? 0;
+        spawnSwingVfx(x, y, z, src?.yaw ?? 0);
+        audio.swing({ x, y, z }); // bat swing whoosh at the swinger
         break;
       }
       case 'stun': {
         const tgt = ev.targetId !== undefined ? entities.get(ev.targetId) : undefined;
-        spawnStunVfx(ev.x ?? tgt?.x ?? 0, ev.y ?? tgt?.y ?? 0, ev.z ?? tgt?.z ?? 0);
+        const x = ev.x ?? tgt?.x ?? 0;
+        const y = ev.y ?? tgt?.y ?? 0;
+        const z = ev.z ?? tgt?.z ?? 0;
+        spawnStunVfx(x, y, z);
+        audio.hit({ x, y, z }); // bat-hit impact at the victim
         pushFeedLine(`#${ev.actorId ?? '?'} stunned #${ev.targetId ?? '?'} 🦇`);
         break;
       }
       case 'infect': {
         const tgt = ev.targetId !== undefined ? entities.get(ev.targetId) : undefined;
-        spawnInfectVfx(ev.x ?? tgt?.x ?? 0, ev.y ?? tgt?.y ?? 0, ev.z ?? tgt?.z ?? 0);
+        const x = ev.x ?? tgt?.x ?? 0;
+        const y = ev.y ?? tgt?.y ?? 0;
+        const z = ev.z ?? tgt?.z ?? 0;
+        spawnInfectVfx(x, y, z);
+        audio.infect({ x, y, z }); // infection stinger at the victim
         pushFeedLine(`Player #${ev.targetId ?? '?'} was turned 🧟`);
         break;
       }
@@ -677,6 +676,14 @@ function animate(): void {
 
   // 5. Reconcile meshes with the interpolated world; get the local player's pos.
   const localFeet = syncEntities(entities, now);
+
+  // 5b. Audio: anchor the listener to the local player (facing = look yaw) and
+  //     drive positional footsteps for everyone moving. Skipped until we have a
+  //     local body, since positional panning/attenuation needs a reference point.
+  if (localFeet !== null) {
+    audio.setListener(localFeet, controls.yaw);
+    driveFootsteps(entities, dtMs);
+  }
 
   // 6. Advance transient combat VFX and the turn feed, culling the expired.
   updateEffects(dtMs);
@@ -703,6 +710,7 @@ function animate(): void {
     rttMs: connection.rttMs,
     tick: connection.tick,
     team: localTeam(entities),
+    stamina: localStamina(entities),
     ready: localReady,
     lookHint: controls.pointerLocked
       ? 'mouse: look (Esc releases)'
@@ -719,4 +727,6 @@ window.addEventListener('beforeunload', () => {
   connection.close();
   controls.dispose();
   hud.dispose();
+  audioControls.dispose();
+  audio.dispose();
 });
