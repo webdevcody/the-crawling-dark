@@ -10,9 +10,11 @@ in `client/src/entities/Character.ts`. Two implementations honor that seam:
   **named by entity state**.
 
 Which one runs is a single switch in `client/src/main.ts`
-(`CHARACTER_RENDERER: 'procedural' | 'gltf'`). Because the heavy `GLTFLoader` is
-imported **dynamically**, leaving it on `'procedural'` keeps the loader out of
-the main bundle entirely (the default build is byte-identical to before).
+(`CHARACTER_RENDERER: 'procedural' | 'gltf'`). **As of M13 t13b/t13c the default
+is `'gltf'`**, rendering the baked `human.glb` / `zombie.glb` below (with the
+per-body procedural fallback intact). Because the heavy `GLTFLoader` is imported
+**dynamically**, setting the switch back to `'procedural'` keeps the loader out
+of the main bundle entirely (a byte-identical, zero-asset build).
 
 ## Graceful fallback (same philosophy as audio/textures)
 
@@ -47,26 +49,32 @@ single model serves both teams; a distinct `zombie` URL model-swaps on infection
 
 ## What ships today: procedural, CC0 by construction
 
-To keep the repo self-contained and offline (no network fetch of binaries), the
+To keep the repo self-contained and offline (no network fetch of binaries), every
 model shipped here is **baked by our own code** and is therefore **CC0 /
 public-domain** — nothing to attribute, nothing to download:
 
-| File | Baked by | License |
-| ---- | -------- | ------- |
-| `character.glb` | `scripts/gen-character-glb.mjs` | CC0 |
+| File | Baked by | License | Role |
+| ---- | -------- | ------- | ---- |
+| `human.glb` | `scripts/gen-human-glb.mjs` | CC0 | **shipped** — the human body (t13b): upright, tapered limbs + rounded head, holds a baseball bat |
+| `zombie.glb` | `scripts/gen-zombie-glb.mjs` | CC0 | **shipped** — the zombie body (t13c): hunched, gaunt, asymmetric arms + lolling head; model-swaps on infection |
+| `character.glb` | `scripts/gen-character-glb.mjs` | CC0 | pipeline test fixture (the original t13a box-man) |
 
-`character.glb` is a jointed box-man (torso + head + two arms + two legs) sized
-to the procedural rig's proportions, with one looping clip per state above. It
-exists to **exercise + verify** the pipeline, not as final art — flip the switch
-to `'gltf'` to see it render/animate. Regenerate anytime with:
+`human.glb` / `zombie.glb` are the models the `'gltf'` renderer loads today —
+distinct silhouettes and per-state clips, not final AAA art but a real upgrade
+over the box-man and each other. `character.glb` remains as the minimal
+fixture that **exercises + verifies** the seam. Regenerate any of them:
 
 ```
+node scripts/gen-human-glb.mjs
+node scripts/gen-zombie-glb.mjs
 node scripts/gen-character-glb.mjs
 ```
 
-Verify it (headless load → clone → mixer, asserting the clip/node contract):
+Verify each (headless load → clone → mixer, asserting the clip/node contract):
 
 ```
+node scripts/verify-human-glb.mjs
+node scripts/verify-zombie-glb.mjs
 node scripts/verify-character-glb.mjs
 ```
 
@@ -85,7 +93,12 @@ record each pack's name + URL here when you commit its files:
 
 | File(s) | Source pack | URL | License |
 | ------- | ----------- | --- | ------- |
-| _(none yet — procedural placeholder)_ | — | — | CC0 |
+| `human.glb` | baked by `scripts/gen-human-glb.mjs` (t13b) | — (authored in-repo) | CC0 |
+| `zombie.glb` | baked by `scripts/gen-zombie-glb.mjs` (t13c) | — (authored in-repo) | CC0 |
+
+To swap in externally-authored art instead, drop a real `.glb` over `human.glb`
+/ `zombie.glb` (keep the clip names + Y-up feet-at-origin rig) and record its
+pack + URL above — **no loader code changes**.
 
 ## Notes
 
