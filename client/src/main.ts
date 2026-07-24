@@ -49,6 +49,7 @@ import { FollowCamera } from './scene/FollowCamera';
 import { buildTown } from './scene/TownView';
 import { buildEnvironment, disposeEnvironment } from './scene/Environment';
 import { Water } from './scene/Water';
+import { TextureLibrary, makeStandardMaterial, makeGroundDirtSet } from './scene/TextureLibrary';
 import { Character } from './entities/Character';
 import {
   configureRenderer,
@@ -71,6 +72,10 @@ renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 // M6 (t6e): enable the moon's soft shadow map (see Atmosphere.ts).
 configureRenderer(renderer);
+// M10 (t10a): capture the GPU's max anisotropy so every tiled PBR texture the
+// TextureLibrary hands out stays crisp at grazing angles. Must run before any
+// world/material is built (the town is built later, on WELCOME).
+TextureLibrary.init(renderer);
 app.appendChild(renderer.domElement);
 
 /* -------------------------------------------------------------------------- */
@@ -105,11 +110,19 @@ const follow = new FollowCamera(camera);
 
 const groundGeometry = new THREE.PlaneGeometry(MAP_SIZE, MAP_SIZE);
 groundGeometry.rotateX(-Math.PI / 2);
-const groundMaterial = new THREE.MeshStandardMaterial({
-  color: 0x141c26,
-  roughness: 1,
-  metalness: 0,
-});
+// M10 (t10a demo / t10b): the ground is the pipeline's first real surface — a
+// tiled procedural dirt PBR material (albedo + bump-normal + roughness) instead
+// of the former flat 0x141c26 plane. One tile spans GROUND_TILE_METERS, so the
+// map repeats MAP_SIZE / GROUND_TILE_METERS times across the plane; the maps are
+// seamless so there is no visible repeat/seam at play distance. If texture
+// generation is unavailable (offline/headless), makeStandardMaterial falls back
+// to the old flat color automatically.
+const GROUND_TILE_METERS = 8;
+const groundRepeat = MAP_SIZE / GROUND_TILE_METERS;
+const groundMaterial = makeStandardMaterial(
+  TextureLibrary.get('ground-dirt', () => makeGroundDirtSet(256)),
+  { repeat: groundRepeat, color: 0x141c26, roughness: 1, metalness: 0, normalScale: 0.8 },
+);
 const ground = new THREE.Mesh(groundGeometry, groundMaterial);
 ground.receiveShadow = true;
 scene.add(ground);
