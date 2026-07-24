@@ -10,22 +10,30 @@ import {
   SNAPSHOT_TICK_INTERVAL,
   MAX_PLAYERS,
   PLAYER_RADIUS,
+  ATTACK_COOLDOWN_MS,
+  BAT_RANGE,
+  BAT_ARC_DEG,
+  STUN_DURATION_MS,
+  BAT_KNOCKBACK,
+  INFECTION_CONTACT_RADIUS,
+  RESPAWN_DELAY_MS,
   generateWorld,
   collideCircleXZ,
   step,
-  type MoveState,
   type World,
   type EntitySnapshot,
   type EntityState,
+  type GameEvent,
   type WelcomeMessage,
   type SnapshotMessage,
+  type RoundMessage,
   type PongMessage,
   type WireData,
 } from '@crawling-dark/shared';
 import { Player } from './Player';
 
 /**
- * The single game room for The Crawling Dark (M2 · t2c).
+ * The single game room for The Crawling Dark (M3 · t3a/t3b/t3c).
  *
  * Responsibilities:
  *  - Registry: assign a distinct, monotonically increasing `playerId` per
@@ -33,14 +41,17 @@ import { Player } from './Player';
  *    roster at {@link MAX_PLAYERS} (spillover spectates), and clean up on close.
  *  - Simulation: a drift-resistant, fixed-timestep loop at {@link TICK_RATE} Hz
  *    that advances each player's authoritative {@link MoveState} via the shared,
- *    deterministic {@link step}, then resolves circle-vs-AABB collision against
- *    the seeded {@link World} so nobody walks through buildings or the wall.
+ *    deterministic {@link step}, resolves circle-vs-AABB collision against the
+ *    seeded {@link World}, then resolves combat (bat swings, infections) and the
+ *    down->respawn-as-zombie lifecycle in the DESIGN §5 order.
  *  - Snapshots: every {@link SNAPSHOT_TICK_INTERVAL} ticks, broadcast one base
- *    snapshot to all sockets with a per-recipient `ack` (their last applied seq).
+ *    snapshot (with any buffered gameplay events) to all sockets plus a
+ *    lightweight {@link RoundMessage} carrying live team counts for the HUD.
  *
- * Movement is now the real M2 model: yaw-relative horizontal motion with
- * gravity/jump on Y (both from the shared sim) and authoritative XZ collision
- * against the town generated here from {@link MAP_SEED}.
+ * Combat model (see DESIGN §1/§5): a HUMAN's ATTACK is a bat swing — a cone hit
+ * that knocks back and stuns zombies (never removes them, no friendly fire). A
+ * ZOMBIE's ATTACK is a claw that opens a short window during which a human in
+ * contact range is infected (downed), then respawns on the zombie team.
  */
 
 /** Fixed map seed for the town; the client rebuilds the identical world from it. */
@@ -60,6 +71,33 @@ const DT = TICK_MS / 1000;
  * process (GC pause, debugger) cannot trigger a spiral of death.
  */
 const MAX_CATCHUP_STEPS = 5;
+
+/**
+ * How long (ms) an accepted ATTACK keeps its "window" open. This is a
+ * server-local combat tunable (no shared constant exists): it drives the brief
+ * `attack` animation state for a swing/claw, and for a zombie it is the live
+ * contact-infection window. Kept short so a claw is a deliberate contact hit
+ * rather than a lingering aura; a few ticks at 30 Hz.
+ */
+const ATTACK_WINDOW_MS = 300;
+
+/**
+ * Per-tick multiplicative decay applied to a zombie's bat knockback velocity.
+ * The shared {@link MoveState} carries no horizontal momentum, so knockback is
+ * an impulse we integrate and bleed off here: at 0.8/tick (~30 Hz) an 8 m/s
+ * shove is spent within roughly the first half of the 1.5 s stun.
+ */
+const KNOCKBACK_DECAY_PER_TICK = 0.8;
+
+/** Knockback speed (m/s) below which we snap to exactly zero, so it settles cleanly. */
+const KNOCKBACK_EPSILON = 0.05;
+
+/**
+ * Cosine of the bat cone's half-angle. Precomputed once from {@link BAT_ARC_DEG}
+ * so the per-target hit test is a single dot-product comparison (a direction is
+ * "in front" iff its dot with the facing is >= this).
+ */
+const BAT_HALF_ARC_COS = Math.cos((BAT_ARC_DEG / 2) * (Math.PI / 180));
 
 export class Room {
   /** All connected clients (active players and spectators), keyed by id. */
@@ -86,6 +124,13 @@ export class Room {
 
   /** Unspent real time (ms) carried between pumps for drift-free stepping. */
   private accumulator = 0;
+
+  /**
+   * Gameplay events buffered as they occur during ticks (attack/stun/infect),
+   * flushed into the NEXT broadcast snapshot and then cleared. Buffering rather
+   * than sending inline keeps events aligned with the snapshot cadence.
+   */
+  private readonly events: GameEvent[] = [];
 
   /* ------------------------------------------------------------------------ */
   /* Registry / lifecycle                                                     */
@@ -144,7 +189,7 @@ export class Room {
 
   /**
    * Decode and dispatch one client frame. Unknown or not-yet-implemented
-   * messages (ATTACK, READY) are ignored; they land in later milestones.
+   * messages (READY) are ignored; they land in later milestones.
    */
   handleMessage(player: Player, data: WireData): void {
     const msg = decodeClientMessage(data);
@@ -162,6 +207,17 @@ export class Room {
         player.lastSeq = Math.max(player.lastSeq, msg.seq);
         break;
 
+      case MessageType.Attack:
+        // t3a/t3b: accept a bat swing (human) or claw (zombie). Reject it for
+        // spectators, the downed, or the stunned, and while the cooldown is
+        // still running. Otherwise latch it to resolve on the next fixed step
+        // (DESIGN §5, steps 4-5) and start the cooldown so it can't be spammed.
+        if (player.spectator || player.down || player.isStunned) break;
+        if (player.attackCooldownMs > 0) break;
+        player.pendingAttack = true;
+        player.attackCooldownMs = ATTACK_COOLDOWN_MS;
+        break;
+
       case MessageType.Ping: {
         // t1e: echo the probe id straight back so the client can time RTT.
         const pong: PongMessage = { t: MessageType.Pong, id: msg.id };
@@ -170,7 +226,7 @@ export class Room {
       }
 
       default:
-        // ATTACK / READY: no-op in M1.
+        // READY: no-op until the M5 lobby/round state machine.
         break;
     }
   }
@@ -217,12 +273,29 @@ export class Room {
     }
   }
 
-  /** Advance exactly one fixed tick: apply inputs, then maybe broadcast. */
+  /**
+   * Advance exactly one fixed tick, in the DESIGN §5 pipeline order:
+   *  - (scaffold) ensure a patient-zero zombie exists for the M3 demo;
+   *  - step 2: integrate each active player's movement (honoring stun/down);
+   *  - step 4: resolve bat swings (cone hit -> stun + knockback);
+   *  - step 5: resolve infections (open zombie window -> down human);
+   *  - flip any elapsed death-cams onto the zombie team;
+   *  - every ~2nd tick, broadcast a snapshot + round counts.
+   *
+   * (Zombie AI — §5 step 3 — and the round state machine — §5 step 6 — arrive
+   * in M4/M5; the patient-zero scaffold and the count-only ROUND stand in.)
+   */
   private step(): void {
+    this.ensurePatientZero();
+
     for (const p of this.players.values()) {
       if (p.spectator) continue;
       this.integrate(p);
     }
+
+    this.resolveAttacks();
+    this.resolveInfections();
+    this.resolveRespawns();
 
     this.tick++;
 
@@ -232,30 +305,235 @@ export class Room {
   }
 
   /**
-   * Integrate one player's authoritative movement for a single fixed tick.
+   * Integrate one player's authoritative state for a single fixed tick.
    *
-   * Pipeline (see DESIGN §5): advance the unobstructed kinematics with the
-   * shared, deterministic {@link step} (yaw-relative XZ motion + gravity/jump on
-   * Y), then resolve circle-vs-AABB collision on the XZ plane against the seeded
-   * world via {@link collideCircleXZ}. Y is left exactly as the sim produced it
-   * (gravity/jump/ground clamp); only X and Z are collision-corrected, so a
-   * player can neither pass through a building nor cross the perimeter wall.
+   * Pipeline (DESIGN §5, step 2): tick the combat timers down, then advance
+   * movement subject to the player's condition:
+   *  - DOWN: frozen for the death-cam — no input, gravity, or knockback slide.
+   *  - STUNNED: movement input is suppressed (cannot walk), but the player still
+   *    falls and still slides under any active bat knockback.
+   *  - NORMAL: full yaw-relative movement from {@link step}.
+   * In the moving cases the horizontal knockback impulse (which the shared
+   * {@link MoveState} can't carry) is applied and decayed, then X/Z are resolved
+   * against the town via {@link collideCircleXZ}. Y is left exactly as the sim
+   * produced it.
    */
   private integrate(p: Player): void {
-    const next = step(p.move, { keys: p.input.keys, yaw: p.input.yaw }, DT);
-    const resolved = collideCircleXZ(this.world, next.x, next.z, PLAYER_RADIUS);
+    this.advanceTimers(p);
+
+    // A downed player is frozen in place for its death-cam.
+    if (p.down) return;
+
+    // Stunned players can't walk (input suppressed) but still fall and slide.
+    const keys = p.isStunned ? 0 : p.input.keys;
+    const next = step(p.move, { keys, yaw: p.input.yaw }, DT);
+
+    // Apply then decay the horizontal knockback impulse (see Player.kvx/kvz).
+    const px = next.x + p.kvx * DT;
+    const pz = next.z + p.kvz * DT;
+    p.kvx = decayKnockback(p.kvx);
+    p.kvz = decayKnockback(p.kvz);
+
+    const resolved = collideCircleXZ(this.world, px, pz, PLAYER_RADIUS);
     p.move = { ...next, x: resolved.x, z: resolved.z };
   }
 
+  /** Tick every millisecond countdown timer on a player down by one fixed step. */
+  private advanceTimers(p: Player): void {
+    if (p.attackCooldownMs > 0) p.attackCooldownMs = Math.max(0, p.attackCooldownMs - TICK_MS);
+    if (p.stunMs > 0) p.stunMs = Math.max(0, p.stunMs - TICK_MS);
+    if (p.attackWindowMs > 0) p.attackWindowMs = Math.max(0, p.attackWindowMs - TICK_MS);
+    if (p.down && p.respawnMs > 0) p.respawnMs = Math.max(0, p.respawnMs - TICK_MS);
+  }
+
   /* ------------------------------------------------------------------------ */
-  /* Snapshots (t1c)                                                          */
+  /* Combat resolution (t3a/t3b/t3c)                                          */
+  /* ------------------------------------------------------------------------ */
+
+  /**
+   * TEMPORARY M3 SCAFFOLD — remove once M4 spawns the NPC patient-zero zombie
+   * and M5 owns team assignment via the round state machine.
+   *
+   * To make a self-contained 2-tab demo playable before those exist: as soon as
+   * there are >= 2 active (non-spectator) players and nobody is on the zombie
+   * team yet, promote the lowest-id active human to be "patient zero". Because
+   * this runs every tick (and ids never repeat), it also re-seeds a zombie if
+   * the only zombie disconnects while >= 2 humans remain.
+   */
+  private ensurePatientZero(): void {
+    if (this.activeCount() < 2) return;
+
+    let patientZero: Player | null = null;
+    for (const p of this.players.values()) {
+      if (p.spectator) continue;
+      if (p.team === 'zombie') return; // a zombie already exists — nothing to do.
+      if (p.down) continue; // skip humans already mid-infection.
+      if (patientZero === null || p.id < patientZero.id) patientZero = p;
+    }
+
+    if (patientZero === null) return;
+    patientZero.team = 'zombie';
+    this.clearCombatState(patientZero);
+  }
+
+  /**
+   * DESIGN §5 step 4. Consume each latched attack request: open the attacker's
+   * short attack/claw window and buffer the `attack` event (swing VFX). A HUMAN
+   * additionally resolves an instantaneous bat cone hit here; a ZOMBIE's contact
+   * infection is handled continuously by {@link resolveInfections} while its
+   * window is open. A swing is dropped if the attacker was stunned or downed by
+   * an earlier-resolved player this same tick (bat interrupts claw).
+   */
+  private resolveAttacks(): void {
+    for (const p of this.players.values()) {
+      if (!p.pendingAttack) continue;
+      p.pendingAttack = false;
+
+      if (p.spectator || p.down || p.isStunned) continue;
+
+      p.attackWindowMs = ATTACK_WINDOW_MS;
+      this.buffer({ kind: 'attack', actorId: p.id, x: p.move.x, y: p.move.y, z: p.move.z });
+
+      if (p.team === 'human') this.resolveBatSwing(p);
+    }
+  }
+
+  /**
+   * Bat cone hit test for one human attacker (t3a). Every zombie within
+   * {@link BAT_RANGE} AND inside the {@link BAT_ARC_DEG} cone centered on the
+   * attacker's facing is knocked straight back at {@link BAT_KNOCKBACK} and
+   * stunned for {@link STUN_DURATION_MS}. No friendly fire: only zombies are
+   * valid targets (downed humans are still team 'human', so they're excluded).
+   */
+  private resolveBatSwing(attacker: Player): void {
+    // Attacker facing on XZ, matching the shared sim's forward axis
+    // (forward = (-sin yaw, -cos yaw); yaw 0 faces -Z).
+    const fx = -Math.sin(attacker.move.yaw);
+    const fz = -Math.cos(attacker.move.yaw);
+
+    for (const target of this.players.values()) {
+      if (target === attacker || target.spectator) continue;
+      if (target.team !== 'zombie') continue;
+
+      const dx = target.move.x - attacker.move.x;
+      const dz = target.move.z - attacker.move.z;
+      const dist = Math.hypot(dx, dz);
+      if (dist > BAT_RANGE) continue;
+
+      // Cone test: with unit facing and unit target direction, their dot equals
+      // cos(angle between), so "in front" means dot >= cos(halfArc).
+      if (dist > 1e-6) {
+        const dot = (fx * dx + fz * dz) / dist;
+        if (dot < BAT_HALF_ARC_COS) continue;
+      }
+
+      // HIT — knock the zombie away from the attacker (fall back to the
+      // attacker's facing if they are exactly coincident), and stun it.
+      let kdx = fx;
+      let kdz = fz;
+      if (dist > 1e-6) {
+        kdx = dx / dist;
+        kdz = dz / dist;
+      }
+      target.kvx = kdx * BAT_KNOCKBACK;
+      target.kvz = kdz * BAT_KNOCKBACK;
+      target.stunMs = STUN_DURATION_MS;
+
+      this.buffer({
+        kind: 'stun',
+        actorId: attacker.id,
+        targetId: target.id,
+        x: target.move.x,
+        y: target.move.y,
+        z: target.move.z,
+      });
+    }
+  }
+
+  /**
+   * DESIGN §5 step 5. For every zombie whose claw window is open and that is not
+   * stunned, infect any human within {@link INFECTION_CONTACT_RADIUS} on XZ:
+   * down it, start its {@link RESPAWN_DELAY_MS} death-cam, and buffer an
+   * `infect` event. A human already down is skipped, so no one is infected twice.
+   */
+  private resolveInfections(): void {
+    const r2 = INFECTION_CONTACT_RADIUS * INFECTION_CONTACT_RADIUS;
+
+    for (const zombie of this.players.values()) {
+      if (zombie.spectator || zombie.team !== 'zombie') continue;
+      if (zombie.attackWindowMs <= 0 || zombie.isStunned) continue;
+
+      for (const human of this.players.values()) {
+        if (human === zombie || human.spectator) continue;
+        if (human.team !== 'human' || human.down) continue; // double-infect guard
+
+        const dx = human.move.x - zombie.move.x;
+        const dz = human.move.z - zombie.move.z;
+        if (dx * dx + dz * dz > r2) continue;
+
+        // Infect: down the human, start its death-cam, and wipe any combat state
+        // so it can't keep swinging or sliding while frozen.
+        human.down = true;
+        human.respawnMs = RESPAWN_DELAY_MS;
+        human.stunMs = 0;
+        human.attackWindowMs = 0;
+        human.pendingAttack = false;
+        human.kvx = 0;
+        human.kvz = 0;
+
+        this.buffer({
+          kind: 'infect',
+          actorId: zombie.id,
+          targetId: human.id,
+          x: human.move.x,
+          y: human.move.y,
+          z: human.move.z,
+        });
+      }
+    }
+  }
+
+  /**
+   * Flip any downed player whose death-cam has elapsed onto the zombie team
+   * (t3c), clearing its combat state so it resumes control as a zombie with the
+   * same movement set but a claw instead of a bat.
+   */
+  private resolveRespawns(): void {
+    for (const p of this.players.values()) {
+      if (!p.down || p.respawnMs > 0) continue;
+      p.team = 'zombie';
+      this.clearCombatState(p);
+    }
+  }
+
+  /** Reset all combat/infection timers and flags (used on turn / promotion). */
+  private clearCombatState(p: Player): void {
+    p.stunMs = 0;
+    p.attackWindowMs = 0;
+    p.attackCooldownMs = 0;
+    p.down = false;
+    p.respawnMs = 0;
+    p.kvx = 0;
+    p.kvz = 0;
+    p.pendingAttack = false;
+  }
+
+  /** Buffer a gameplay event for inclusion in the next broadcast snapshot. */
+  private buffer(event: GameEvent): void {
+    this.events.push(event);
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /* Snapshots (t1c) + round counts (t3c)                                     */
   /* ------------------------------------------------------------------------ */
 
   /**
    * Build one base snapshot of all active entities and broadcast it to every
-   * socket (players and spectators). Positions come straight from each player's
-   * collision-resolved {@link MoveState}. `ack` is personalized per recipient to
-   * that client's last applied input seq.
+   * socket (players and spectators), then broadcast the live team counts.
+   * Positions come straight from each player's collision-resolved
+   * {@link MoveState}; `kind` reflects the player's team and `state` folds in
+   * combat states. Any events buffered since the previous broadcast are drained
+   * into this snapshot's optional `events`. `ack` is personalized per recipient.
    */
   private broadcastSnapshot(): void {
     const entities: EntitySnapshot[] = [];
@@ -263,14 +541,19 @@ export class Room {
       if (p.spectator) continue;
       entities.push({
         id: p.id,
-        kind: 'human',
+        kind: p.team,
         x: p.move.x,
         y: p.move.y,
         z: p.move.z,
         yaw: p.move.yaw,
-        state: deriveState(p.move, p.input.keys),
+        state: deriveState(p),
       });
     }
+
+    // Drain the event buffer; only attach `events` when non-empty so idle
+    // snapshots stay lean. Slice so each broadcast owns an immutable copy.
+    const events = this.events.length > 0 ? this.events.slice() : undefined;
+    this.events.length = 0;
 
     const tick = this.tick;
     for (const p of this.players.values()) {
@@ -280,8 +563,39 @@ export class Room {
         ack: p.lastSeq,
         entities,
       };
+      if (events) snapshot.events = events;
       this.send(p, snapshot);
     }
+
+    this.broadcastRound();
+  }
+
+  /**
+   * Broadcast a lightweight {@link RoundMessage} carrying live team counts so
+   * the HUD can read them (t3c): humans still alive (human team, not down, not
+   * spectator) and zombies (zombie team, not spectator).
+   *
+   * NOTE: `phase`/`timeLeftMs` are placeholders until M5 builds the real round
+   * state machine (lobby -> countdown -> active -> ended) with the 5:00 clock
+   * and win/lose. M3 only needs the counts.
+   */
+  private broadcastRound(): void {
+    let humansAlive = 0;
+    let zombieCount = 0;
+    for (const p of this.players.values()) {
+      if (p.spectator) continue;
+      if (p.team === 'zombie') zombieCount++;
+      else if (!p.down) humansAlive++;
+    }
+
+    const round: RoundMessage = {
+      t: MessageType.Round,
+      phase: 'active',
+      timeLeftMs: 0,
+      humansAlive,
+      zombieCount,
+    };
+    for (const p of this.players.values()) this.send(p, round);
   }
 
   /* ------------------------------------------------------------------------ */
@@ -289,20 +603,40 @@ export class Room {
   /* ------------------------------------------------------------------------ */
 
   /** Serialize and send a message to a player if its socket is open. */
-  private send(player: Player, msg: WelcomeMessage | SnapshotMessage | PongMessage): void {
+  private send(
+    player: Player,
+    msg: WelcomeMessage | SnapshotMessage | RoundMessage | PongMessage,
+  ): void {
     if (player.socket.readyState !== WebSocket.OPEN) return;
     player.socket.send(encode(msg));
   }
 }
 
 /**
- * Derive the coarse animation state from the authoritative {@link MoveState}
- * plus the held keys: airborne (`!grounded`) reads as 'jump'; on the ground,
- * no direction key held is 'idle', otherwise crawl mode wins ('crawl'), then
- * Run ('run'), else 'walk'. The crawl-before-run priority mirrors the shared
- * sim's `moveSpeed` (you cannot sprint while low-profile).
+ * Decay one axis of a knockback velocity by one tick, snapping to exactly zero
+ * once it drops below {@link KNOCKBACK_EPSILON} so the impulse settles cleanly
+ * instead of trailing an ever-smaller float forever.
  */
-function deriveState(move: MoveState, keys: number): EntityState {
+function decayKnockback(v: number): number {
+  const decayed = v * KNOCKBACK_DECAY_PER_TICK;
+  return Math.abs(decayed) < KNOCKBACK_EPSILON ? 0 : decayed;
+}
+
+/**
+ * Derive the coarse animation/combat state for a player entity. Combat states
+ * win over movement, most-incapacitated first: `down` (turning) > `stun`
+ * (bat-hit) > `attack` (mid swing/claw window). Otherwise the M2 movement
+ * derivation applies: airborne (`!grounded`) reads as 'jump'; on the ground,
+ * no direction key held is 'idle', otherwise crawl mode wins ('crawl'), then
+ * Run ('run'), else 'walk'.
+ */
+function deriveState(p: Player): EntityState {
+  if (p.down) return 'down';
+  if (p.isStunned) return 'stun';
+  if (p.attackWindowMs > 0) return 'attack';
+
+  const move = p.move;
+  const keys = p.input.keys;
   if (!move.grounded) return 'jump';
 
   const moving =

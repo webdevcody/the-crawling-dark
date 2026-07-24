@@ -26,6 +26,7 @@ import {
   encode,
   decodeServerMessage,
   type EntitySnapshot,
+  type GameEvent,
 } from '@crawling-dark/shared';
 
 import { SnapshotInterpolator, type InterpolatedEntity } from './Interpolation';
@@ -59,6 +60,12 @@ const RTT_SMOOTHING = 0.2;
 
 /** Cap on outstanding (unanswered) ping timestamps we retain. */
 const MAX_PENDING_PINGS = 32;
+
+/**
+ * Cap on gameplay events buffered for the render loop. Bounds memory if the
+ * loop stalls (e.g. a backgrounded tab stops draining); the newest events win.
+ */
+const MAX_PENDING_EVENTS = 128;
 
 /* -------------------------------------------------------------------------- */
 /* URL resolution                                                             */
@@ -101,6 +108,15 @@ export class Connection {
   private readonly pendingPings = new Map<number, number>();
 
   /**
+   * Gameplay events (attack/stun/infect/…) received since the render loop last
+   * drained them, in arrival order. The renderer pulls these each frame via
+   * {@link drainEvents} to spawn combat VFX and push turn-feed lines; keeping
+   * them in a plain queue (rather than firing a callback) preserves this
+   * module's freedom from any Three.js / rendering dependency.
+   */
+  private readonly pendingEvents: GameEvent[] = [];
+
+  /**
    * Buffers received snapshots and samples them ~{@link INTERP_BUFFER_MS} in the
    * past, so remote entities render smoothly between authoritative updates.
    */
@@ -128,6 +144,7 @@ export class Connection {
   private smoothedRtt = 0;
 
   private inputSeq = 0;
+  private attackSeq = 0;
   private pingSeq = 0;
 
   private reconnectAttempts = 0;
@@ -193,6 +210,16 @@ export class Connection {
     return this.interp.sample(nowMs ?? performance.now());
   }
 
+  /**
+   * Return every gameplay event received since the last call and clear the
+   * queue (an empty array when nothing is pending). Called once per render
+   * frame; the renderer turns these into combat VFX and turn-feed lines.
+   */
+  drainEvents(): GameEvent[] {
+    if (this.pendingEvents.length === 0) return [];
+    return this.pendingEvents.splice(0, this.pendingEvents.length);
+  }
+
   /* ---- Connection lifecycle -------------------------------------------- */
 
   /** Open the socket (idempotent while an open/connecting socket exists). */
@@ -211,6 +238,7 @@ export class Connection {
     this.clearReconnect();
     this.stopPingLoop();
     this.interp.clear();
+    this.pendingEvents.length = 0;
     if (this.socket) {
       this.socket.onopen = null;
       this.socket.onmessage = null;
@@ -260,6 +288,7 @@ export class Connection {
     // Drop buffered snapshots so stale remote positions don't linger across the
     // gap; the interpolator refills from fresh snapshots after we reconnect.
     this.interp.clear();
+    this.pendingEvents.length = 0;
     this.socket = null;
     if (this.disposed) {
       this.statusValue = 'closed';
@@ -311,6 +340,12 @@ export class Connection {
         }
         // Feed the interpolation buffer, tagged with the local receive time.
         this.interp.push(msg.entities, performance.now());
+        // Surface any events the server buffered onto this snapshot so the
+        // render loop can spawn combat VFX and update the turn feed. We stay
+        // render-agnostic here: only the raw shared events are queued.
+        if (msg.events && msg.events.length > 0) {
+          this.enqueueEvents(msg.events);
+        }
         break;
       }
 
@@ -323,7 +358,15 @@ export class Connection {
         break;
       }
 
-      // ROUND / EVENT are not consumed in M1; ignore them for now.
+      case MessageType.Event:
+        // A standalone event (not folded into a snapshot). Its `t` tag rides
+        // along harmlessly; downstream consumers read only the GameEvent fields.
+        this.enqueueEvents([msg]);
+        break;
+
+      // ROUND is not consumed on the client: team counts are derived from the
+      // entity kinds each render frame, which keeps the HUD correct even if the
+      // server never sends ROUND. Ignore it (and any unknown type) for now.
       default:
         break;
     }
@@ -334,6 +377,17 @@ export class Connection {
       this.smoothedRtt === 0
         ? sample
         : this.smoothedRtt * (1 - RTT_SMOOTHING) + sample * RTT_SMOOTHING;
+  }
+
+  /**
+   * Queue gameplay events for the render loop to {@link drainEvents}. If the
+   * loop stalls (e.g. a backgrounded tab), bound memory by keeping only the
+   * most recent {@link MAX_PENDING_EVENTS}.
+   */
+  private enqueueEvents(events: readonly GameEvent[]): void {
+    for (const ev of events) this.pendingEvents.push(ev);
+    const overflow = this.pendingEvents.length - MAX_PENDING_EVENTS;
+    if (overflow > 0) this.pendingEvents.splice(0, overflow);
   }
 
   /* ---- Outbound frames -------------------------------------------------- */
@@ -355,6 +409,17 @@ export class Connection {
       yaw,
       dt,
     });
+  }
+
+  /**
+   * Request a bat swing. The server validates range/cooldown and, if the swing
+   * lands, echoes `attack`/`stun`/`infect` events back on the next snapshot; we
+   * only fire the intent here. `seq` rides its own monotonic counter (kept
+   * separate from the INPUT `seq` so input acks stay clean) — the server just
+   * needs it to increase. No-op while the socket is down.
+   */
+  sendAttack(): void {
+    this.send({ t: MessageType.Attack, seq: ++this.attackSeq });
   }
 
   private startPingLoop(): void {
