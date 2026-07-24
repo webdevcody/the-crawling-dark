@@ -38,6 +38,7 @@
  */
 
 import { AssetLibrary, type AudioManifest } from './AssetLibrary';
+import type { Lake, Tree, World } from '@crawling-dark/shared';
 
 /* -------------------------------------------------------------------------- */
 /* Types + tunables                                                           */
@@ -692,5 +693,367 @@ export class AudioEngine {
       data[i] = clamp(last * 3.5, -1, 1);
     }
     return buf;
+  }
+
+  /* ---- Environment ambience (M12 · t12d) -------------------------------- */
+
+  /*
+   * Occasional, randomized, **positional** environment one-shots layered UNDER
+   * the ambient bed + music + SFX: a distant wolf howl or wind gust from an
+   * unseen bearing, a wooden creak or leaf-rustle from the perimeter forest, and
+   * water lapping at the lake shore. Every voice is a self-contained Web-Audio
+   * synth (oscillators / filtered noise) routed through the shared {@link oneShot}
+   * spatializer, so it pans + attenuates against the listener and works with NO
+   * asset files. Feature-tied voices read the seeded {@link World} (lake circle,
+   * forest {@link Tree}s) and only fire when their feature exists AND sits within
+   * earshot, so the atmosphere reacts to where the player actually is (leaves by
+   * the treeline, laps by the water) without ever crowding the mix — one event
+   * fires per randomized {@link nextEnvDelayMs interval}, at a subtle level.
+   */
+
+  /** Cadence bounds (ms) between environment one-shots — low density on purpose. */
+  private static readonly ENV_MIN_MS = 4000;
+  private static readonly ENV_MAX_MS = 9000;
+  /** Distance band (m) for the feature-free distant voices; both < MAX_AUDIBLE. */
+  private static readonly ENV_FAR_MIN = 24;
+  private static readonly ENV_FAR_MAX = 40;
+
+  /** Time accumulated (ms) toward the next scheduled environment event. */
+  private envAccumMs = 0;
+  /** Randomized delay (ms) until the next event; re-rolled after each fire. */
+  private envNextMs = this.nextEnvDelayMs();
+
+  /**
+   * Per-frame environment driver: accumulate `dtMs` and, once the randomized
+   * interval elapses, fire exactly one positional ambient one-shot chosen from
+   * the currently-eligible pool (see {@link emitEnvironment}), then re-roll the
+   * next interval. No-ops until the context is actually running, so it never
+   * schedules into a suspended graph. Call it every frame with the live
+   * {@link World} (may be `null` before the town is generated).
+   */
+  updateEnvironment(dtMs: number, world: World | null): void {
+    const ctx = this.ctx;
+    if (ctx === null || ctx.state !== 'running') return;
+    this.envAccumMs += dtMs;
+    if (this.envAccumMs < this.envNextMs) return;
+    this.envAccumMs = 0;
+    this.envNextMs = this.nextEnvDelayMs();
+    this.emitEnvironment(world);
+  }
+
+  /**
+   * Assemble the pool of eligible emitters and fire one at random. Feature-tied
+   * voices (water lap at the shoreline, leaves + creaks from a forest tree) are
+   * only added when their world feature exists AND lands within earshot of the
+   * listener, so a picked voice is never silently culled by the spatializer. The
+   * two distant, feature-free voices (howl, wind gust) are positioned relative
+   * to the listener and are always eligible, so every fire produces sound.
+   */
+  private emitEnvironment(world: World | null): void {
+    const y = this.listener.y;
+    const pool: Array<() => void> = [];
+
+    // Water lapping at the lake's edge — a point on the shoreline circle.
+    const water = world?.water ?? null;
+    if (water !== null) {
+      const shore = this.envLakePos(water, y);
+      if (this.withinEarshot(shore)) pool.push(() => this.waterLap(shore));
+    }
+
+    // Forest rustle / creak — a random nearby perimeter tree, if any is close.
+    const trees = world?.trees;
+    if (trees !== undefined && trees.length > 0) {
+      const near = this.pickAudibleTree(trees, y);
+      if (near !== null) {
+        pool.push(() => this.leaves(near));
+        pool.push(() => this.creak(near));
+      }
+    }
+
+    // Distant, feature-free atmosphere — always available around the listener.
+    pool.push(() => this.howl(this.envDistantPos(y)));
+    pool.push(() => this.windGust(this.envDistantPos(y)));
+
+    pool[Math.floor(Math.random() * pool.length)]();
+  }
+
+  /** Roll a fresh inter-event delay (ms) uniformly in the cadence band. */
+  private nextEnvDelayMs(): number {
+    const lo = AudioEngine.ENV_MIN_MS;
+    const hi = AudioEngine.ENV_MAX_MS;
+    return lo + Math.random() * (hi - lo);
+  }
+
+  /**
+   * A world position on a random bearing around the listener at a largish (but
+   * still audible) distance — for the non-feature distant voices. Emitted at the
+   * listener's `y` so panning is purely horizontal.
+   */
+  private envDistantPos(y: number): Point3 {
+    const ang = Math.random() * Math.PI * 2;
+    const d =
+      AudioEngine.ENV_FAR_MIN +
+      Math.random() * (AudioEngine.ENV_FAR_MAX - AudioEngine.ENV_FAR_MIN);
+    return {
+      x: this.listener.x + Math.cos(ang) * d,
+      y,
+      z: this.listener.z + Math.sin(ang) * d,
+    };
+  }
+
+  /**
+   * A random point on the lake's shoreline: a random angle around the lake
+   * centre at (roughly) the water radius, nudged a little in/out so the lap
+   * isn't always dead on the rim. Absolute world-space, so it may be far from
+   * the listener — the caller earshot-checks before using it.
+   */
+  private envLakePos(water: Lake, y: number): Point3 {
+    const ang = Math.random() * Math.PI * 2;
+    const r = Math.max(0, water.radius + (Math.random() * 1.4 - 0.5));
+    return {
+      x: water.cx + Math.cos(ang) * r,
+      y,
+      z: water.cz + Math.sin(ang) * r,
+    };
+  }
+
+  /**
+   * Pick one uniformly-random tree within {@link MAX_AUDIBLE} of the listener,
+   * or `null` if none is close (the player is away from the treeline). Uses
+   * single-pass reservoir sampling (k = 1) so it needs one XZ distance test per
+   * tree and no temporary array — cheap even for the dense perimeter forest.
+   */
+  private pickAudibleTree(trees: readonly Tree[], y: number): Point3 | null {
+    const r2 = MAX_AUDIBLE * MAX_AUDIBLE;
+    let chosen: Tree | null = null;
+    let seen = 0;
+    for (const t of trees) {
+      const dx = t.x - this.listener.x;
+      const dz = t.z - this.listener.z;
+      if (dx * dx + dz * dz > r2) continue;
+      seen += 1;
+      // Every audible tree gets an equal 1/seen chance of being the survivor.
+      if (Math.random() * seen < 1) chosen = t;
+    }
+    return chosen === null ? null : { x: chosen.x, y, z: chosen.z };
+  }
+
+  /** Whether `p` is within {@link MAX_AUDIBLE} of the listener (a 3-D test). */
+  private withinEarshot(p: Point3): boolean {
+    const dx = p.x - this.listener.x;
+    const dy = p.y - this.listener.y;
+    const dz = p.z - this.listener.z;
+    return dx * dx + dy * dy + dz * dz <= MAX_AUDIBLE * MAX_AUDIBLE;
+  }
+
+  /** A random start offset (s) into the cached noise buffer, for grain variety. */
+  private noiseOffset(): number {
+    const buf = this.noiseBuffer;
+    return buf === null ? 0 : Math.random() * buf.duration;
+  }
+
+  /**
+   * A **distant wolf howl**: a sawtooth that glides up to a held note then falls
+   * away, wavered by a gentle vibrato and softened through a resonant low-pass so
+   * it reads as far-off and mournful. Slow swell in/out. Optional real sample via
+   * `'howl'`; synth fallback otherwise. Positioned by the caller.
+   */
+  howl(pos: Point3): void {
+    if (this.playBuffer('howl', pos, { rate: 0.97 + Math.random() * 0.06 })) return;
+    this.oneShot(pos, (ctx, t0, dest) => {
+      const dur = 1.3 + Math.random() * 0.6;
+      const tEnd = t0 + dur + 0.05;
+      const base = 300 + Math.random() * 60;
+
+      // Voice: glide up to the held note, sustain, then droop away.
+      const osc = ctx.createOscillator();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(base * 0.8, t0);
+      osc.frequency.linearRampToValueAtTime(base * 1.5, t0 + dur * 0.35);
+      osc.frequency.setValueAtTime(base * 1.5, t0 + dur * 0.7);
+      osc.frequency.linearRampToValueAtTime(base * 0.9, tEnd);
+
+      // Vibrato so the held note wavers like a real howl.
+      const vib = ctx.createOscillator();
+      vib.type = 'sine';
+      vib.frequency.value = 5 + Math.random() * 1.5;
+      const vibGain = ctx.createGain();
+      vibGain.gain.value = base * 0.03;
+      vib.connect(vibGain).connect(osc.frequency);
+
+      // Resonant low-pass gives it a soft, vocal, distant colour.
+      const lp = ctx.createBiquadFilter();
+      lp.type = 'lowpass';
+      lp.frequency.value = 900;
+      lp.Q.value = 4;
+
+      const env = this.env(ctx, t0, dur * 0.3, dur * 0.7, 0.32);
+      osc.connect(lp).connect(env).connect(dest);
+
+      osc.start(t0);
+      osc.stop(tEnd);
+      vib.start(t0);
+      vib.stop(tEnd);
+      return [osc, vib];
+    });
+  }
+
+  /**
+   * A **wind gust**: looping noise through a band-pass that sweeps up then back
+   * down as the gust rises and dies, under a slow swell envelope. Optional real
+   * sample via `'windGust'`; synth fallback otherwise. Positioned by the caller.
+   */
+  windGust(pos: Point3): void {
+    if (this.playBuffer('windGust', pos)) return;
+    this.oneShot(pos, (ctx, t0, dest) => {
+      const dur = 1.4 + Math.random() * 1.0;
+      const tEnd = t0 + dur + 0.05;
+
+      const src = ctx.createBufferSource();
+      src.buffer = this.noiseBuffer;
+      src.loop = true; // gusts outlast the 1.5 s buffer — loop so it never runs dry
+      src.playbackRate.value = 0.85 + Math.random() * 0.3;
+
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.Q.value = 0.8;
+      bp.frequency.setValueAtTime(300, t0);
+      bp.frequency.linearRampToValueAtTime(1100, t0 + dur * 0.5);
+      bp.frequency.linearRampToValueAtTime(280, tEnd);
+
+      const env = this.env(ctx, t0, dur * 0.45, dur * 0.55, 0.26);
+      src.connect(bp).connect(env).connect(dest);
+
+      src.start(t0, this.noiseOffset());
+      src.stop(tEnd);
+      return [src];
+    });
+  }
+
+  /**
+   * A **wooden creak**: a low sawtooth groan whose pitch creeps up under strain,
+   * through a woody resonant band-pass, its amplitude stuttered by a fast square
+   * tremolo for the stick-slip "creeeak". Optional real sample via `'creak'`;
+   * synth fallback otherwise. Positioned by the caller (a forest tree).
+   */
+  creak(pos: Point3): void {
+    if (this.playBuffer('creak', pos)) return;
+    this.oneShot(pos, (ctx, t0, dest) => {
+      const dur = 0.5 + Math.random() * 0.4;
+      const tEnd = t0 + dur + 0.05;
+      const f = 90 + Math.random() * 50;
+
+      const osc = ctx.createOscillator();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(f, t0);
+      osc.frequency.linearRampToValueAtTime(f * 1.3, tEnd);
+
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = 320;
+      bp.Q.value = 6;
+
+      const env = this.env(ctx, t0, 0.06, dur, 0.22);
+
+      // Tremolo: a square LFO drives a gain around 0.55 (±0.45 → 0.10..1.00) so
+      // the groan stutters instead of sustaining flatly.
+      const trem = ctx.createOscillator();
+      trem.type = 'square';
+      trem.frequency.value = 18 + Math.random() * 14;
+      const tremGain = ctx.createGain();
+      tremGain.gain.value = 0.45;
+      const mod = ctx.createGain();
+      mod.gain.value = 0.55;
+      trem.connect(tremGain).connect(mod.gain);
+
+      osc.connect(bp).connect(env).connect(mod).connect(dest);
+
+      osc.start(t0);
+      osc.stop(tEnd);
+      trem.start(t0);
+      trem.stop(tEnd);
+      return [osc, trem];
+    });
+  }
+
+  /**
+   * **Water lapping** at the shore: soft low-passed noise (the cutoff falling as
+   * the wavelet settles) shaped into two quick swells — the "lap-lap" of a small
+   * wave. Optional real sample via `'waterLap'`; synth fallback otherwise.
+   * Positioned by the caller (a point on the lake shoreline).
+   */
+  waterLap(pos: Point3): void {
+    if (this.playBuffer('waterLap', pos)) return;
+    this.oneShot(pos, (ctx, t0, dest) => {
+      const dur = 0.5 + Math.random() * 0.3;
+      const tEnd = t0 + dur + 0.05;
+
+      const src = ctx.createBufferSource();
+      src.buffer = this.noiseBuffer;
+      src.loop = true;
+      src.playbackRate.value = 0.9 + Math.random() * 0.3;
+
+      const lp = ctx.createBiquadFilter();
+      lp.type = 'lowpass';
+      lp.Q.value = 0.9;
+      lp.frequency.setValueAtTime(1400, t0);
+      lp.frequency.exponentialRampToValueAtTime(500, tEnd);
+
+      // Two-bump envelope → the gentle double lap of a wavelet meeting the bank.
+      const env = ctx.createGain();
+      env.gain.setValueAtTime(0.0001, t0);
+      env.gain.linearRampToValueAtTime(0.2, t0 + 0.05);
+      env.gain.exponentialRampToValueAtTime(0.06, t0 + dur * 0.45);
+      env.gain.linearRampToValueAtTime(0.16, t0 + dur * 0.6);
+      env.gain.exponentialRampToValueAtTime(0.0001, tEnd);
+
+      src.connect(lp).connect(env).connect(dest);
+      src.start(t0, this.noiseOffset());
+      src.stop(tEnd);
+      return [src];
+    });
+  }
+
+  /**
+   * **Rustling leaves**: dry high-passed noise with a mid-rate sine flutter so it
+   * shivers like wind through the canopy. Short and soft. Optional real sample
+   * via `'leaves'`; synth fallback otherwise. Positioned by the caller (a tree).
+   */
+  leaves(pos: Point3): void {
+    if (this.playBuffer('leaves', pos)) return;
+    this.oneShot(pos, (ctx, t0, dest) => {
+      const dur = 0.4 + Math.random() * 0.4;
+      const tEnd = t0 + dur + 0.05;
+
+      const src = ctx.createBufferSource();
+      src.buffer = this.noiseBuffer;
+      src.loop = true;
+      src.playbackRate.value = 1.0 + Math.random() * 0.4;
+
+      const hp = ctx.createBiquadFilter();
+      hp.type = 'highpass';
+      hp.frequency.value = 2000;
+      hp.Q.value = 0.6;
+
+      const env = this.env(ctx, t0, 0.08, dur, 0.16);
+
+      // Flutter: a sine LFO drives a gain around 0.6 (±0.4) for the shimmer.
+      const flut = ctx.createOscillator();
+      flut.type = 'sine';
+      flut.frequency.value = 9 + Math.random() * 6;
+      const flutGain = ctx.createGain();
+      flutGain.gain.value = 0.4;
+      const mod = ctx.createGain();
+      mod.gain.value = 0.6;
+      flut.connect(flutGain).connect(mod.gain);
+
+      src.connect(hp).connect(env).connect(mod).connect(dest);
+
+      src.start(t0, this.noiseOffset());
+      src.stop(tEnd);
+      flut.start(t0);
+      flut.stop(tEnd);
+      return [src, flut];
+    });
   }
 }
