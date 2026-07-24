@@ -9,6 +9,10 @@ import {
   TICK_MS,
   SNAPSHOT_TICK_INTERVAL,
   MAX_PLAYERS,
+  MIN_PLAYERS_TO_START,
+  NPC_CHASE_SPEED,
+  NPC_WANDER_SPEED,
+  NPC_ATTACK_RANGE,
   PLAYER_RADIUS,
   ATTACK_COOLDOWN_MS,
   BAT_RANGE,
@@ -31,6 +35,7 @@ import {
   type WireData,
 } from '@crawling-dark/shared';
 import { Player } from './Player';
+import { ZombieAI, forwardFromYaw, type ZombieIntent } from './ai';
 
 /**
  * The single game room for The Crawling Dark (M3 · t3a/t3b/t3c).
@@ -110,6 +115,12 @@ export class Room {
    */
   private readonly world: World = generateWorld(MAP_SEED);
 
+  /**
+   * Reactive steering brain for the NPC patient-zero zombie (M4 · t4a), built
+   * over the same seeded {@link world} it navigates and collides against.
+   */
+  private readonly zombieAI = new ZombieAI(this.world);
+
   /** Next id to hand out. Only ever increments, so ids are never reused. */
   private nextPlayerId = 1;
 
@@ -145,7 +156,7 @@ export class Room {
   private activeCount(): number {
     let n = 0;
     for (const p of this.players.values()) {
-      if (!p.spectator) n++;
+      if (!p.spectator && !p.isNpc) n++;
     }
     return n;
   }
@@ -275,23 +286,29 @@ export class Room {
 
   /**
    * Advance exactly one fixed tick, in the DESIGN §5 pipeline order:
-   *  - (scaffold) ensure a patient-zero zombie exists for the M3 demo;
+   *  - ensure the single NPC patient-zero zombie exists (M4 · t4a);
    *  - step 2: integrate each active player's movement (honoring stun/down);
+   *  - step 3: advance the NPC zombie AI (seek + avoid + contact attack);
    *  - step 4: resolve bat swings (cone hit -> stun + knockback);
    *  - step 5: resolve infections (open zombie window -> down human);
    *  - flip any elapsed death-cams onto the zombie team;
    *  - every ~2nd tick, broadcast a snapshot + round counts.
    *
-   * (Zombie AI — §5 step 3 — and the round state machine — §5 step 6 — arrive
-   * in M4/M5; the patient-zero scaffold and the count-only ROUND stand in.)
+   * (The round state machine — §5 step 6 — arrives in M5; the count-only ROUND
+   * stands in until then.)
    */
   private step(): void {
-    this.ensurePatientZero();
+    this.ensureNpcZombie();
 
+    // Step 2 — integrate the human-controlled players from their inputs.
     for (const p of this.players.values()) {
-      if (p.spectator) continue;
+      if (p.spectator || p.isNpc) continue;
       this.integrate(p);
     }
+
+    // Step 3 — advance the NPC zombie AI (seek + building avoidance, then its
+    // contact-attack decision) now that the humans have moved this tick.
+    this.updateNpcs();
 
     this.resolveAttacks();
     this.resolveInfections();
@@ -351,29 +368,126 @@ export class Room {
   /* ------------------------------------------------------------------------ */
 
   /**
-   * TEMPORARY M3 SCAFFOLD — remove once M4 spawns the NPC patient-zero zombie
-   * and M5 owns team assignment via the round state machine.
-   *
-   * To make a self-contained 2-tab demo playable before those exist: as soon as
-   * there are >= 2 active (non-spectator) players and nobody is on the zombie
-   * team yet, promote the lowest-id active human to be "patient zero". Because
-   * this runs every tick (and ids never repeat), it also re-seeds a zombie if
-   * the only zombie disconnects while >= 2 humans remain.
+   * Ensure the single NPC "patient zero" zombie exists once a game is under way
+   * (M4 · t4a). Standing in for the M5 round state machine, we treat "enough
+   * humans have connected to play" ({@link MIN_PLAYERS_TO_START} active players)
+   * as the round start and, exactly once, spawn one server-controlled zombie out
+   * on the ring road. The horde then grows ONLY from turned players: no further
+   * NPCs are ever spawned, and no human is auto-promoted.
    */
-  private ensurePatientZero(): void {
-    if (this.activeCount() < 2) return;
+  private ensureNpcZombie(): void {
+    if (this.hasNpc()) return;
+    if (this.activeCount() < MIN_PLAYERS_TO_START) return;
+    this.spawnNpcZombie();
+  }
 
-    let patientZero: Player | null = null;
+  /** Whether the lone NPC patient-zero zombie has already been spawned. */
+  private hasNpc(): boolean {
     for (const p of this.players.values()) {
-      if (p.spectator) continue;
-      if (p.team === 'zombie') return; // a zombie already exists — nothing to do.
-      if (p.down) continue; // skip humans already mid-infection.
-      if (patientZero === null || p.id < patientZero.id) patientZero = p;
+      if (p.isNpc) return true;
     }
+    return false;
+  }
 
-    if (patientZero === null) return;
-    patientZero.team = 'zombie';
-    this.clearCombatState(patientZero);
+  /**
+   * Spawn the lone NPC zombie on the ring road — well outside the central plaza
+   * where humans spawn — on the zombie team, with a fresh id that never collides
+   * with a player's. It joins the same {@link players} map as everyone else, so
+   * snapshots, bat swings, and the infection loop all treat it uniformly; it
+   * simply carries no socket and is steered by {@link ZombieAI}.
+   */
+  private spawnNpcZombie(): void {
+    const id = this.nextPlayerId++;
+    // A corner of the ring road: buildings never reach past ~51 m from centre and
+    // the wall sits at ~half, so this is clear street. Collision-resolve once as a
+    // belt-and-braces guard against any awkward placement.
+    const edge = this.world.half - 5;
+    const spawn = collideCircleXZ(this.world, edge, edge, PLAYER_RADIUS);
+
+    const npc = new Player(id, null, false, spawn.x, spawn.z, true);
+    npc.team = 'zombie';
+    this.players.set(id, npc);
+  }
+
+  /**
+   * Step 3 of the tick: drive every NPC zombie. For each, tick its combat timers,
+   * gather the live human candidates, ask the {@link ZombieAI} where it wants to
+   * go, move it there (collision-resolved like a player), and finally let it
+   * decide whether to claw. Ordered after player integration so the NPC chases
+   * up-to-date human positions.
+   */
+  private updateNpcs(): void {
+    const humans = this.liveHumans();
+    for (const npc of this.players.values()) {
+      if (!npc.isNpc) continue;
+      this.advanceTimers(npc);
+      const intent = this.zombieAI.update(npc, humans, TICK_MS);
+      this.integrateNpc(npc, intent);
+      this.decideNpcAttack(npc, humans);
+    }
+  }
+
+  /** Live, infectable humans (non-spectator, team 'human', not downed). */
+  private liveHumans(): Player[] {
+    const humans: Player[] = [];
+    for (const p of this.players.values()) {
+      if (p.spectator || p.isNpc) continue;
+      if (p.team === 'human' && !p.down) humans.push(p);
+    }
+    return humans;
+  }
+
+  /**
+   * Move one NPC for a tick per its {@link ZombieIntent}. It faces and advances
+   * along the AI's steered heading at chase or patrol speed (zero while stunned,
+   * so a bat hit still stops it), applies then decays any bat knockback exactly
+   * like a player, and resolves circle-vs-AABB collision against the town. The
+   * synthesized `input.keys` exist only so {@link deriveState} reports the right
+   * walk/run/idle animation for the NPC in snapshots — the NPC never runs `step`.
+   */
+  private integrateNpc(npc: Player, intent: ZombieIntent): void {
+    const moving = intent.moving && !npc.isStunned;
+    const speed = moving ? (intent.running ? NPC_CHASE_SPEED : NPC_WANDER_SPEED) : 0;
+
+    const f = forwardFromYaw(intent.desiredYaw);
+    const px = npc.move.x + f.x * speed * DT + npc.kvx * DT;
+    const pz = npc.move.z + f.z * speed * DT + npc.kvz * DT;
+    npc.kvx = decayKnockback(npc.kvx);
+    npc.kvz = decayKnockback(npc.kvz);
+
+    const resolved = collideCircleXZ(this.world, px, pz, PLAYER_RADIUS);
+    npc.move = {
+      ...npc.move,
+      x: resolved.x,
+      z: resolved.z,
+      y: 0,
+      vy: 0,
+      grounded: true,
+      yaw: intent.desiredYaw,
+    };
+
+    // Reflect motion in the animation state (deriveState reads input.keys).
+    npc.input = {
+      keys: moving ? (intent.running ? InputKey.Forward | InputKey.Run : InputKey.Forward) : 0,
+      yaw: intent.desiredYaw,
+    };
+  }
+
+  /**
+   * Decide whether the NPC claws this tick — t4c EXTENSION POINT.
+   *
+   * t4a ships this as a no-op: the NPC hunts but cannot yet turn anyone. t4c
+   * fills it in so that when a human is within {@link NPC_ATTACK_RANGE} and the
+   * NPC is off cooldown and un-stunned, it latches `pendingAttack` (and starts
+   * {@link ATTACK_COOLDOWN_MS}) exactly as a client ATTACK would — reusing the
+   * existing {@link resolveAttacks} -> {@link resolveInfections} turn flow so an
+   * NPC claw infects identically to a player zombie's. Speed/aggro tuning lives
+   * here too. Contained to the Room so it never overlaps the targeting work in
+   * `ai.ts`.
+   */
+  private decideNpcAttack(npc: Player, humans: readonly Player[]): void {
+    void npc;
+    void humans;
   }
 
   /**
@@ -607,7 +721,7 @@ export class Room {
     player: Player,
     msg: WelcomeMessage | SnapshotMessage | RoundMessage | PongMessage,
   ): void {
-    if (player.socket.readyState !== WebSocket.OPEN) return;
+    if (player.socket === null || player.socket.readyState !== WebSocket.OPEN) return;
     player.socket.send(encode(msg));
   }
 }

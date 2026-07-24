@@ -37,8 +37,12 @@ export class Player {
   /** Room-unique, monotonically increasing id. Never reused across the room. */
   readonly id: number;
 
-  /** The underlying `ws` socket used to push messages to this client. */
-  readonly socket: WebSocket;
+  /**
+   * The underlying `ws` socket used to push messages to this client, or `null`
+   * for a server-spawned NPC (the M4 patient-zero zombie), which has no client
+   * to talk to. {@link Room.send} skips any player whose socket is `null`.
+   */
+  readonly socket: WebSocket | null;
 
   /** Display name claimed via {@link JoinMessage}; empty until a JOIN arrives. */
   name = '';
@@ -134,10 +138,26 @@ export class Player {
    */
   pendingAttack = false;
 
-  constructor(id: number, socket: WebSocket, spectator: boolean, x: number, z: number) {
+  /**
+   * True for the server-controlled NPC zombie (M4 · t4a). An NPC carries the
+   * exact same combat/movement state as a player — so infections, bat swings,
+   * snapshots, and the turn flow all treat it uniformly — but it has no socket
+   * and is steered by {@link ZombieAI} instead of client INPUT frames.
+   */
+  readonly isNpc: boolean;
+
+  constructor(
+    id: number,
+    socket: WebSocket | null,
+    spectator: boolean,
+    x: number,
+    z: number,
+    isNpc = false,
+  ) {
     this.id = id;
     this.socket = socket;
     this.spectator = spectator;
+    this.isNpc = isNpc;
     this.move = createMoveState({ x, z });
   }
 

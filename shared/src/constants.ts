@@ -133,3 +133,48 @@ export const MAP_SIZE = 128;
 
 /** Default port the authoritative WebSocket server listens on. */
 export const DEFAULT_SERVER_PORT = 8080;
+
+/* -------------------------------------------------------------------------- */
+/* Zombie AI (M4)                                                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * NPC "patient zero" hunt speed in world units (meters) per second. Set between
+ * {@link MOVE_SPEED_WALK} and {@link MOVE_SPEED_RUN} on purpose: a sprinting
+ * human outruns the zombie, but a walking or crawling one is caught — the AI is
+ * threatening yet escapable (DESIGN §M4).
+ */
+export const NPC_CHASE_SPEED = 4.0;
+
+/** NPC patrol speed (m/s) while it has no target to hunt — a slow prowl. */
+export const NPC_WANDER_SPEED = 1.6;
+
+/**
+ * How far (meters) the NPC can perceive an upright, moving human in the open.
+ * Beyond this radius a human is invisible to target acquisition (t4b).
+ */
+export const AI_DETECTION_RADIUS = 34.0;
+
+/**
+ * Detection-radius multiplier for a CRAWLING human. Crawlers present a smaller
+ * silhouette and are only spotted within this fraction of {@link AI_DETECTION_RADIUS},
+ * which is what makes crawling genuine stealth — the trade-off is you're slow (t4b).
+ */
+export const AI_CRAWL_DETECTION_MULT = 0.45;
+
+/**
+ * Grace period (ms) the NPC keeps chasing a lost target after line of sight is
+ * broken before giving up and re-acquiring. Stops the zombie from instantly
+ * forgetting a human who ducks behind a wall for a moment (t4b).
+ */
+export const AI_LOS_GRACE_MS = 1500;
+
+/** Length (meters) of the NPC's building-avoidance probe rays (steering look-ahead). */
+export const AI_AVOID_RAY_LENGTH = 6.0;
+
+/**
+ * Range (meters) at which the NPC commits to a claw at a human. Deliberately a
+ * touch larger than {@link INFECTION_CONTACT_RADIUS} so the attack window is
+ * already open by the time contact lands and the infection resolves (t4c).
+ */
+export const NPC_ATTACK_RANGE = 1.6;
