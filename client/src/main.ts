@@ -1,24 +1,34 @@
 /**
- * The Crawling Dark — client entry point (M1 · t1e demo).
+ * The Crawling Dark — client entry point (M2 · Movement & World demo).
  *
- * Wires the networking spine (`Connection`) and keyboard sampler (`Controls`)
- * into a minimal Three.js scene: a dark, fogged play area viewed from a fixed
- * slightly-angled overhead camera. Each authoritative entity is drawn as a
- * unit box resting on the ground; the local player (matching WELCOME.playerId)
- * is highlighted. A dark-themed HUD reports connection status, playerId,
- * entity count, server tick, and smoothed RTT.
+ * Wires the M2 systems into a playable third-person scene:
+ *   - the seeded town ({@link buildTown}) rendered from the same {@link World}
+ *     the server collides against, rebuilt on the client from WELCOME's `mapSeed`;
+ *   - keyboard + pointer-lock mouse look ({@link Controls}) packed into INPUT
+ *     frames (held-key bitmask + look yaw) streamed every frame;
+ *   - a third-person spring-arm follow camera ({@link FollowCamera}) that trails
+ *     the local player and retracts around walls;
+ *   - remote (and local) entities rendered from interpolated snapshots
+ *     (~INTERP_BUFFER_MS in the past) so everyone moves smoothly.
  *
- * Collision, a spring-arm/third-person follow camera, and entity interpolation
- * are intentionally out of scope for M1 (they land in M2/M6).
+ * There is no client-side prediction yet — the local player is also drawn from
+ * interpolated server state, so it lags input slightly. Prediction/reconciliation
+ * is M6 (t6a); until then this is the interpolation-only MVP the design calls for.
  */
 
 import * as THREE from 'three';
 import {
   MAP_SIZE,
-  type EntitySnapshot,
+  PLAYER_RADIUS,
+  PLAYER_HEIGHT,
+  CRAWL_HEIGHT,
+  generateWorld,
+  type World,
 } from '@crawling-dark/shared';
 import { Connection } from './net/Connection';
 import { Controls } from './input/Controls';
+import { FollowCamera } from './scene/FollowCamera';
+import { buildTown } from './scene/TownView';
 
 const app = document.querySelector<HTMLDivElement>('#app') ?? document.body;
 
@@ -38,32 +48,33 @@ app.appendChild(renderer.domElement);
 const scene = new THREE.Scene();
 const DARK = new THREE.Color(0x05070a);
 scene.background = DARK;
-// Linear fog so distant ground dissolves into the crawling dark.
-scene.fog = new THREE.Fog(DARK, MAP_SIZE * 0.12, MAP_SIZE * 0.85);
+// Linear fog so distant geometry dissolves into the crawling dark.
+scene.fog = new THREE.Fog(DARK, MAP_SIZE * 0.12, MAP_SIZE * 0.9);
 
 /* -------------------------------------------------------------------------- */
-/* Camera — fixed, gently-angled overhead view of the play area              */
+/* Camera — third-person spring-arm follow (starts at a gentle overview)      */
 /* -------------------------------------------------------------------------- */
 
 const camera = new THREE.PerspectiveCamera(
-  55,
+  60,
   window.innerWidth / window.innerHeight,
   0.1,
   1000,
 );
-// A stable 3rd-person-ish angle looking at the origin: high enough to read
-// box movement across the XZ plane, close enough that boxes stay legible.
-camera.position.set(0, MAP_SIZE * 0.2, MAP_SIZE * 0.26);
-camera.lookAt(0, 0, 0);
+// Until the local player exists, sit at a readable overview of the plaza.
+camera.position.set(0, 14, 20);
+camera.lookAt(0, 1, 0);
+
+const follow = new FollowCamera(camera);
 
 /* -------------------------------------------------------------------------- */
-/* Ground plane                                                               */
+/* Ground plane + grid                                                        */
 /* -------------------------------------------------------------------------- */
 
 const groundGeometry = new THREE.PlaneGeometry(MAP_SIZE, MAP_SIZE);
 groundGeometry.rotateX(-Math.PI / 2);
 const groundMaterial = new THREE.MeshStandardMaterial({
-  color: 0x1a2430,
+  color: 0x141c26,
   roughness: 1,
   metalness: 0,
 });
@@ -71,10 +82,9 @@ const ground = new THREE.Mesh(groundGeometry, groundMaterial);
 ground.receiveShadow = true;
 scene.add(ground);
 
-// A faint grid overlay so movement across the plane has a spatial reference.
-const grid = new THREE.GridHelper(MAP_SIZE, MAP_SIZE / 4, 0x2a3a48, 0x141d26);
+const grid = new THREE.GridHelper(MAP_SIZE, MAP_SIZE / 4, 0x243244, 0x121a22);
 (grid.material as THREE.Material).transparent = true;
-(grid.material as THREE.Material).opacity = 0.35;
+(grid.material as THREE.Material).opacity = 0.28;
 grid.position.y = 0.01;
 scene.add(grid);
 
@@ -82,14 +92,14 @@ scene.add(grid);
 /* Lighting                                                                   */
 /* -------------------------------------------------------------------------- */
 
-const ambient = new THREE.AmbientLight(0x22303c, 0.4);
+const ambient = new THREE.AmbientLight(0x2a3846, 0.5);
 scene.add(ambient);
 
-const sun = new THREE.DirectionalLight(0xa9c7ff, 1.1);
-sun.position.set(MAP_SIZE * 0.3, MAP_SIZE * 0.6, MAP_SIZE * 0.2);
-sun.target.position.set(0, 0, 0);
-scene.add(sun);
-scene.add(sun.target);
+const moon = new THREE.DirectionalLight(0xa9c7ff, 1.0);
+moon.position.set(MAP_SIZE * 0.3, MAP_SIZE * 0.6, MAP_SIZE * 0.2);
+moon.target.position.set(0, 0, 0);
+scene.add(moon);
+scene.add(moon.target);
 
 /* -------------------------------------------------------------------------- */
 /* Networking + input                                                         */
@@ -97,72 +107,104 @@ scene.add(sun.target);
 
 const connection = new Connection();
 const controls = new Controls();
+controls.attachPointerLock(renderer.domElement);
 connection.connect();
 
 /* -------------------------------------------------------------------------- */
-/* Entity meshes — reconciled against the connection's entity store each frame */
+/* Town — built once WELCOME's mapSeed arrives (identical to the server's)     */
 /* -------------------------------------------------------------------------- */
 
-/** Unit cube shared by every entity mesh; per-entity color lives in materials. */
-const BOX_GEOMETRY = new THREE.BoxGeometry(1, 1, 1);
+/** The seeded town, once we know the seed; drives building meshes + camera collision. */
+let world: World | null = null;
 
-/** Highlight color for the local player so you can tell which box is you. */
+/** Build the town exactly once, as soon as the deterministic seed is known. */
+function ensureWorld(): void {
+  if (world !== null) return;
+  const seed = connection.mapSeed;
+  if (seed === null) return;
+  world = generateWorld(seed);
+  scene.add(buildTown(world));
+}
+
+/* -------------------------------------------------------------------------- */
+/* Entity meshes — reconciled against interpolated snapshots each frame        */
+/* -------------------------------------------------------------------------- */
+
+/** Unit-height player box (footprint = collision diameter); scaled per-frame by profile. */
+const PLAYER_GEOMETRY = new THREE.BoxGeometry(
+  PLAYER_RADIUS * 2,
+  1,
+  PLAYER_RADIUS * 2,
+);
+
+/** Highlight color for the local player so you can tell which body is you. */
 const LOCAL_COLOR = new THREE.Color(0x53ffa8);
 
-/** Live meshes keyed by entity id, mirroring the authoritative store. */
+/** Live meshes keyed by entity id, mirroring the interpolated entity set. */
 const meshes = new Map<number, THREE.Mesh>();
 
 /** Deterministic, well-spread color from an entity id (golden-ratio hue). */
 function colorForId(id: number): THREE.Color {
   const hue = (id * 0.61803398875) % 1;
-  return new THREE.Color().setHSL(hue, 0.65, 0.55);
+  return new THREE.Color().setHSL(hue, 0.6, 0.55);
 }
 
 /** Create (once) the mesh for an entity and add it to the scene. */
-function createMesh(entity: EntitySnapshot, isLocal: boolean): THREE.Mesh {
-  const color = isLocal ? LOCAL_COLOR.clone() : colorForId(entity.id);
+function createMesh(id: number, isLocal: boolean): THREE.Mesh {
+  const color = isLocal ? LOCAL_COLOR.clone() : colorForId(id);
   const material = new THREE.MeshStandardMaterial({
     color,
     roughness: 0.5,
     metalness: 0.1,
-    // Local player glows faintly so it reads even in shadow.
     emissive: isLocal ? LOCAL_COLOR.clone().multiplyScalar(0.25) : 0x000000,
   });
-  const mesh = new THREE.Mesh(BOX_GEOMETRY, material);
+  const mesh = new THREE.Mesh(PLAYER_GEOMETRY, material);
+  mesh.castShadow = true;
   scene.add(mesh);
-  meshes.set(entity.id, mesh);
+  meshes.set(id, mesh);
   return mesh;
 }
 
 /**
- * Reconcile the Three.js meshes with the authoritative entity store: spawn new
- * boxes, update positions/facing, and dispose meshes for departed entities.
+ * Reconcile Three.js meshes with the interpolated entity set: spawn new bodies,
+ * update transforms (height shrinks while crawling; `y` lifts on a jump), and
+ * dispose meshes for entities that have left. Returns the local player's feet
+ * position for the follow camera, or `null` if the local entity isn't present.
  */
-function syncEntities(): void {
-  const store = connection.entities;
+function syncEntities(): { x: number; y: number; z: number } | null {
+  const entities = connection.sampleEntities();
   const localId = connection.playerId;
+  let localFeet: { x: number; y: number; z: number } | null = null;
 
-  // Create / update.
-  for (const entity of store.values()) {
+  for (const entity of entities.values()) {
     const isLocal = entity.id === localId;
-    const mesh = meshes.get(entity.id) ?? createMesh(entity, isLocal);
-    // Box is 1 unit tall; lift by 0.5 so its base rests on the ground plane.
-    mesh.position.set(entity.x, entity.y + 0.5, entity.z);
+    const mesh = meshes.get(entity.id) ?? createMesh(entity.id, isLocal);
+
+    // Crawling presents a low profile; standing bodies are full height.
+    const bodyHeight = entity.state === 'crawl' ? CRAWL_HEIGHT : PLAYER_HEIGHT;
+    mesh.scale.set(1, bodyHeight, 1);
+    // `entity.y` is the feet height (0 on the ground, >0 mid-jump); the box is
+    // centered, so lift it by half its scaled height to rest the base there.
+    mesh.position.set(entity.x, entity.y + bodyHeight / 2, entity.z);
     mesh.rotation.y = entity.yaw;
+
+    if (isLocal) localFeet = { x: entity.x, y: entity.y, z: entity.z };
   }
 
   // Remove departed entities.
   for (const [id, mesh] of meshes) {
-    if (!store.has(id)) {
+    if (!entities.has(id)) {
       scene.remove(mesh);
       (mesh.material as THREE.Material).dispose();
       meshes.delete(id);
     }
   }
+
+  return localFeet;
 }
 
 /* -------------------------------------------------------------------------- */
-/* HUD overlay (dark theme, consistent with index.html)                       */
+/* HUD overlay                                                                */
 /* -------------------------------------------------------------------------- */
 
 const hud = document.createElement('div');
@@ -183,7 +225,7 @@ Object.assign(hud.style, {
 } satisfies Partial<CSSStyleDeclaration>);
 app.appendChild(hud);
 
-/** Human-friendly, color-tagged status dot for the HUD. */
+/** Color-tagged status dot for the HUD. */
 function statusColor(status: string): string {
   switch (status) {
     case 'open':
@@ -198,15 +240,19 @@ function statusColor(status: string): string {
 
 function updateHud(): void {
   const status = connection.status;
-  const playerId = connection.playerId;
+  const lookHint = controls.pointerLocked
+    ? 'mouse: look (Esc releases)'
+    : 'click canvas to look';
   hud.innerHTML =
     `<span style="color:${statusColor(status)}">●</span> ` +
-    `<b>The Crawling Dark</b> · M1\n` +
+    `<b>The Crawling Dark</b> · M2\n` +
     `status    ${status}\n` +
-    `playerId  ${playerId ?? '—'}\n` +
+    `playerId  ${connection.playerId ?? '—'}\n` +
     `entities  ${connection.entityCount}\n` +
     `tick      ${connection.tick}\n` +
-    `rtt       ${connection.rttMs > 0 ? `${Math.round(connection.rttMs)} ms` : '—'}`;
+    `rtt       ${connection.rttMs > 0 ? `${Math.round(connection.rttMs)} ms` : '—'}\n` +
+    `move      WASD · Shift run · C crawl${controls.crawling ? ' [on]' : ''} · Space jump\n` +
+    `${lookHint}`;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -229,13 +275,21 @@ const clock = new THREE.Clock();
 function animate(): void {
   const dt = clock.getDelta();
 
-  // 1. Push this frame's held-key sample to the server (yaw fixed to 0 in M1).
-  connection.sendInput(controls.keys, dt);
+  // 1. Push this frame's input (held-key bitmask + look yaw) to the server.
+  connection.sendInput(controls.keys, dt, controls.yaw);
 
-  // 2. Reconcile the scene with the latest authoritative snapshot.
-  syncEntities();
+  // 2. Build the town once we know the seed.
+  ensureWorld();
 
-  // 3. Refresh the on-screen HUD.
+  // 3. Reconcile meshes with the interpolated world; get the local player's pos.
+  const localFeet = syncEntities();
+
+  // 4. Drive the third-person camera when we have a local body and the town.
+  if (localFeet !== null && world !== null) {
+    follow.update(localFeet, controls.yaw, world, dt);
+  }
+
+  // 5. Refresh the HUD.
   updateHud();
 
   renderer.render(scene, camera);

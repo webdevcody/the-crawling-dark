@@ -1,19 +1,22 @@
 import type { WebSocket } from 'ws';
+import { createMoveState, type MoveState } from '@crawling-dark/shared';
 
 /**
- * Authoritative server-side model of one connected client (M1 · t1b).
+ * Authoritative server-side model of one connected client (M2 · t2c).
  *
  * A `Player` owns its network socket, the last input frame the client sent,
- * and the world-space transform the simulation integrates each tick. Player
- * entities are the only things that appear in a {@link SnapshotMessage} during
- * M1; spectators (connections past {@link MAX_PLAYERS}) keep a `Player` record
- * so they still receive snapshots, but carry no simulated entity.
+ * and the authoritative {@link MoveState} the shared simulation advances each
+ * tick (yaw-relative movement, gravity/jump on Y, and — resolved by the room —
+ * circle-vs-AABB collision against the town on XZ). Player entities are the
+ * only things that appear in a {@link SnapshotMessage}; spectators (connections
+ * past {@link MAX_PLAYERS}) keep a `Player` record so they still receive
+ * snapshots, but carry no simulated entity.
  */
 
 /**
  * The most recent raw input a client has sent. Movement is derived from this
- * every tick by the {@link Room} loop; `yaw` is stored (for facing) but is not
- * used to steer movement in M1 (movement is world-axis only).
+ * every tick by the {@link Room} loop: `keys` drive direction/jump/crawl and
+ * `yaw` steers the (now yaw-relative) horizontal motion.
  */
 export interface PlayerInput {
   /** Held-key bitmask; test bits with {@link InputKey} / {@link hasKey}. */
@@ -22,7 +25,7 @@ export interface PlayerInput {
   yaw: number;
 }
 
-/** One connected client: identity, transform, latest input, and its socket. */
+/** One connected client: identity, movement state, latest input, and its socket. */
 export class Player {
   /** Room-unique, monotonically increasing id. Never reused across the room. */
   readonly id: number;
@@ -33,15 +36,14 @@ export class Player {
   /** Display name claimed via {@link JoinMessage}; empty until a JOIN arrives. */
   name = '';
 
-  /** World-space position in meters. `y` stays 0 in M1 (no jump/gravity). */
-  x = 0;
-  y = 0;
-  z = 0;
+  /**
+   * Authoritative kinematic state (position, facing, vertical velocity, and the
+   * grounded/crawling latches). Advanced each tick by the shared `step`, then
+   * XZ-collision-corrected by the {@link Room}. Snapshots read straight from here.
+   */
+  move: MoveState;
 
-  /** Facing angle around the Y axis in radians (mirrors the latest input yaw). */
-  yaw = 0;
-
-  /** Latest raw input frame; the tick loop integrates movement from `keys`. */
+  /** Latest raw input frame; the tick loop integrates movement from `keys`/`yaw`. */
   input: PlayerInput = { keys: 0, yaw: 0 };
 
   /** Highest input `seq` applied so far; echoed back per-recipient as snapshot `ack`. */
@@ -57,7 +59,6 @@ export class Player {
     this.id = id;
     this.socket = socket;
     this.spectator = spectator;
-    this.x = x;
-    this.z = z;
+    this.move = createMoveState({ x, z });
   }
 }

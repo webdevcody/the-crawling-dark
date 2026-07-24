@@ -12,6 +12,10 @@
  *   - decode inbound frames via {@link decodeServerMessage} and fold them into a
  *     small observable state surface (entity store, playerId, tick, status).
  *
+ * As of M2 (t2f) it also feeds each snapshot into a {@link SnapshotInterpolator}
+ * so remote entities can be rendered ~{@link INTERP_BUFFER_MS} in the past and
+ * move smoothly between the coarse authoritative updates.
+ *
  * All wire shapes come from `@crawling-dark/shared` — the frozen single source
  * of truth. This module never invents its own message formats.
  */
@@ -23,6 +27,8 @@ import {
   decodeServerMessage,
   type EntitySnapshot,
 } from '@crawling-dark/shared';
+
+import { SnapshotInterpolator, type InterpolatedEntity } from './Interpolation';
 
 /* -------------------------------------------------------------------------- */
 /* Public types                                                               */
@@ -94,6 +100,12 @@ export class Connection {
   /** performance.now() timestamps of pings still awaiting a PONG, by id. */
   private readonly pendingPings = new Map<number, number>();
 
+  /**
+   * Buffers received snapshots and samples them ~{@link INTERP_BUFFER_MS} in the
+   * past, so remote entities render smoothly between authoritative updates.
+   */
+  private readonly interp = new SnapshotInterpolator();
+
   private readonly url: string;
   private readonly name: string;
 
@@ -102,6 +114,9 @@ export class Connection {
 
   /** Our controlled entity id, from WELCOME. `null` until the first WELCOME. */
   private ownId: number | null = null;
+
+  /** Deterministic town seed from WELCOME. `null` until the first WELCOME. */
+  private mapSeedValue: number | null = null;
 
   /** Latest server tick seen in a SNAPSHOT. */
   private serverTick = 0;
@@ -139,6 +154,11 @@ export class Connection {
     return this.ownId;
   }
 
+  /** Deterministic map seed from WELCOME, or `null` before it arrives. */
+  get mapSeed(): number | null {
+    return this.mapSeedValue;
+  }
+
   /** Latest server simulation tick from the most recent snapshot. */
   get tick(): number {
     return this.serverTick;
@@ -164,6 +184,15 @@ export class Connection {
     return this.store.size;
   }
 
+  /**
+   * Interpolated entities for rendering, sampled ~INTERP_BUFFER_MS in the past
+   * to smooth snapshot jitter (see {@link SnapshotInterpolator}). Returns a
+   * fresh map keyed by entity id; `nowMs` defaults to `performance.now()`.
+   */
+  sampleEntities(nowMs?: number): Map<number, InterpolatedEntity> {
+    return this.interp.sample(nowMs ?? performance.now());
+  }
+
   /* ---- Connection lifecycle -------------------------------------------- */
 
   /** Open the socket (idempotent while an open/connecting socket exists). */
@@ -181,6 +210,7 @@ export class Connection {
     this.disposed = true;
     this.clearReconnect();
     this.stopPingLoop();
+    this.interp.clear();
     if (this.socket) {
       this.socket.onopen = null;
       this.socket.onmessage = null;
@@ -227,6 +257,9 @@ export class Connection {
   private handleClose(): void {
     this.stopPingLoop();
     this.pendingPings.clear();
+    // Drop buffered snapshots so stale remote positions don't linger across the
+    // gap; the interpolator refills from fresh snapshots after we reconnect.
+    this.interp.clear();
     this.socket = null;
     if (this.disposed) {
       this.statusValue = 'closed';
@@ -266,6 +299,7 @@ export class Connection {
     switch (msg.t) {
       case MessageType.Welcome:
         this.ownId = msg.playerId;
+        this.mapSeedValue = msg.mapSeed;
         break;
 
       case MessageType.Snapshot: {
@@ -275,6 +309,8 @@ export class Connection {
         for (const entity of msg.entities) {
           this.store.set(entity.id, entity);
         }
+        // Feed the interpolation buffer, tagged with the local receive time.
+        this.interp.push(msg.entities, performance.now());
         break;
       }
 

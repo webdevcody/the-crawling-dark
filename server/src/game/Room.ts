@@ -8,12 +8,13 @@ import {
   TICK_RATE,
   TICK_MS,
   SNAPSHOT_TICK_INTERVAL,
-  MAP_SIZE,
   MAX_PLAYERS,
-  MOVE_SPEED_WALK,
-  MOVE_SPEED_RUN,
-  MOVE_SPEED_CRAWL,
   PLAYER_RADIUS,
+  generateWorld,
+  collideCircleXZ,
+  step,
+  type MoveState,
+  type World,
   type EntitySnapshot,
   type EntityState,
   type WelcomeMessage,
@@ -24,23 +25,25 @@ import {
 import { Player } from './Player';
 
 /**
- * The single game room for The Crawling Dark (M1 · t1b/t1c/t1e).
+ * The single game room for The Crawling Dark (M2 · t2c).
  *
  * Responsibilities:
  *  - Registry: assign a distinct, monotonically increasing `playerId` per
  *    connection, spawn each player spread around the origin, cap the active
  *    roster at {@link MAX_PLAYERS} (spillover spectates), and clean up on close.
  *  - Simulation: a drift-resistant, fixed-timestep loop at {@link TICK_RATE} Hz
- *    that integrates world-axis movement from each player's latest input.
+ *    that advances each player's authoritative {@link MoveState} via the shared,
+ *    deterministic {@link step}, then resolves circle-vs-AABB collision against
+ *    the seeded {@link World} so nobody walks through buildings or the wall.
  *  - Snapshots: every {@link SNAPSHOT_TICK_INTERVAL} ticks, broadcast one base
  *    snapshot to all sockets with a per-recipient `ack` (their last applied seq).
  *
- * Movement is intentionally minimal for M1: world-axis only, no yaw-relative
- * steering, no collision beyond clamping to the map bounds — "raw input echoed
- * by the server."
+ * Movement is now the real M2 model: yaw-relative horizontal motion with
+ * gravity/jump on Y (both from the shared sim) and authoritative XZ collision
+ * against the town generated here from {@link MAP_SEED}.
  */
 
-/** Fixed map seed for M1; deterministic town geometry lands in M2. */
+/** Fixed map seed for the town; the client rebuilds the identical world from it. */
 const MAP_SEED = 1;
 
 /** Radius of the spawn ring around the origin, in meters. */
@@ -48,9 +51,6 @@ const SPAWN_RING_RADIUS = 4;
 
 /** Golden angle (radians) used to spread successive spawns around the ring. */
 const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
-
-/** Half the map extent minus the player radius: the clamp bound on X and Z. */
-const MOVE_BOUND = MAP_SIZE / 2 - PLAYER_RADIUS;
 
 /** Fixed simulation delta in seconds (one tick). */
 const DT = TICK_MS / 1000;
@@ -64,6 +64,13 @@ const MAX_CATCHUP_STEPS = 5;
 export class Room {
   /** All connected clients (active players and spectators), keyed by id. */
   private readonly players = new Map<number, Player>();
+
+  /**
+   * The seeded town, generated ONCE from {@link MAP_SEED}. The identical seed is
+   * sent in WELCOME so every client rebuilds byte-for-byte the same geometry;
+   * the server collides players against this world's AABB footprints.
+   */
+  private readonly world: World = generateWorld(MAP_SEED);
 
   /** Next id to hand out. Only ever increments, so ids are never reused. */
   private nextPlayerId = 1;
@@ -225,37 +232,19 @@ export class Room {
   }
 
   /**
-   * Integrate one player's world-axis movement for a single tick.
+   * Integrate one player's authoritative movement for a single fixed tick.
    *
-   * Direction from held keys: Forward→−Z, Back→+Z, Left→−X, Right→+X; diagonals
-   * are normalized. Speed is Run > Crawl > Walk. Position is clamped to the map
-   * bounds; `y` is pinned to 0. `yaw` is stored from the input but never steers
-   * movement in M1.
+   * Pipeline (see DESIGN §5): advance the unobstructed kinematics with the
+   * shared, deterministic {@link step} (yaw-relative XZ motion + gravity/jump on
+   * Y), then resolve circle-vs-AABB collision on the XZ plane against the seeded
+   * world via {@link collideCircleXZ}. Y is left exactly as the sim produced it
+   * (gravity/jump/ground clamp); only X and Z are collision-corrected, so a
+   * player can neither pass through a building nor cross the perimeter wall.
    */
   private integrate(p: Player): void {
-    p.yaw = p.input.yaw;
-
-    const keys = p.input.keys;
-    let dx = 0;
-    let dz = 0;
-    if (hasKey(keys, InputKey.Forward)) dz -= 1;
-    if (hasKey(keys, InputKey.Back)) dz += 1;
-    if (hasKey(keys, InputKey.Left)) dx -= 1;
-    if (hasKey(keys, InputKey.Right)) dx += 1;
-
-    const len = Math.hypot(dx, dz);
-    if (len > 0) {
-      const speed = hasKey(keys, InputKey.Run)
-        ? MOVE_SPEED_RUN
-        : hasKey(keys, InputKey.Crawl)
-          ? MOVE_SPEED_CRAWL
-          : MOVE_SPEED_WALK;
-      const scale = (speed * DT) / len;
-      p.x = clamp(p.x + dx * scale, -MOVE_BOUND, MOVE_BOUND);
-      p.z = clamp(p.z + dz * scale, -MOVE_BOUND, MOVE_BOUND);
-    }
-
-    p.y = 0;
+    const next = step(p.move, { keys: p.input.keys, yaw: p.input.yaw }, DT);
+    const resolved = collideCircleXZ(this.world, next.x, next.z, PLAYER_RADIUS);
+    p.move = { ...next, x: resolved.x, z: resolved.z };
   }
 
   /* ------------------------------------------------------------------------ */
@@ -264,7 +253,8 @@ export class Room {
 
   /**
    * Build one base snapshot of all active entities and broadcast it to every
-   * socket (players and spectators). `ack` is personalized per recipient to
+   * socket (players and spectators). Positions come straight from each player's
+   * collision-resolved {@link MoveState}. `ack` is personalized per recipient to
    * that client's last applied input seq.
    */
   private broadcastSnapshot(): void {
@@ -274,11 +264,11 @@ export class Room {
       entities.push({
         id: p.id,
         kind: 'human',
-        x: p.x,
-        y: p.y,
-        z: p.z,
-        yaw: p.yaw,
-        state: deriveState(p.input.keys),
+        x: p.move.x,
+        y: p.move.y,
+        z: p.move.z,
+        yaw: p.move.yaw,
+        state: deriveState(p.move, p.input.keys),
       });
     }
 
@@ -305,27 +295,24 @@ export class Room {
   }
 }
 
-/** Clamp `v` into the inclusive range [`min`, `max`]. */
-function clamp(v: number, min: number, max: number): number {
-  return v < min ? min : v > max ? max : v;
-}
-
 /**
- * Derive the coarse animation state from held keys: any movement direction
- * plus Run→'run', plus Crawl→'crawl', otherwise 'walk'; no movement→'idle'.
- * Uses the same net-direction test as {@link Room.integrate} so a self-
- * cancelling key combo (Forward+Back) reads as 'idle'.
+ * Derive the coarse animation state from the authoritative {@link MoveState}
+ * plus the held keys: airborne (`!grounded`) reads as 'jump'; on the ground,
+ * no direction key held is 'idle', otherwise crawl mode wins ('crawl'), then
+ * Run ('run'), else 'walk'. The crawl-before-run priority mirrors the shared
+ * sim's `moveSpeed` (you cannot sprint while low-profile).
  */
-function deriveState(keys: number): EntityState {
-  let dx = 0;
-  let dz = 0;
-  if (hasKey(keys, InputKey.Forward)) dz -= 1;
-  if (hasKey(keys, InputKey.Back)) dz += 1;
-  if (hasKey(keys, InputKey.Left)) dx -= 1;
-  if (hasKey(keys, InputKey.Right)) dx += 1;
+function deriveState(move: MoveState, keys: number): EntityState {
+  if (!move.grounded) return 'jump';
 
-  if (dx === 0 && dz === 0) return 'idle';
+  const moving =
+    hasKey(keys, InputKey.Forward) ||
+    hasKey(keys, InputKey.Back) ||
+    hasKey(keys, InputKey.Left) ||
+    hasKey(keys, InputKey.Right);
+
+  if (!moving) return 'idle';
+  if (move.crawling) return 'crawl';
   if (hasKey(keys, InputKey.Run)) return 'run';
-  if (hasKey(keys, InputKey.Crawl)) return 'crawl';
   return 'walk';
 }
