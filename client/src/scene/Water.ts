@@ -18,6 +18,7 @@
 
 import * as THREE from 'three';
 import type { Lake } from '@crawling-dark/shared';
+import { TextureLibrary } from './TextureLibrary';
 
 /* -------------------------------------------------------------------------- */
 /* Tunables                                                                    */
@@ -145,6 +146,11 @@ export class Water {
     // at least twice so even the smallest lake shows more than one wave.
     const repeat = Math.max(2, Math.round(lake.radius / TILE_METERS));
     this.normalMap.repeat.set(repeat, repeat);
+    // M10 (t10e): the water's animated ripple map predates the texture pass, so
+    // give it the same max anisotropy the TextureLibrary applies to every other
+    // tiled surface — the lake then stays crisp at the grazing angles you view it
+    // from, consistent with the town/ground/road materials.
+    this.normalMap.anisotropy = TextureLibrary.maxAnisotropy;
 
     // A disc, not a square, so the surface never pokes past the round shoreline.
     this.geometry = new THREE.CircleGeometry(lake.radius, 64);
