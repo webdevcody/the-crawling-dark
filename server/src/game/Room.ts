@@ -634,6 +634,10 @@ export class Room {
 
     this.tick++;
 
+    // Broadcast every {@link SNAPSHOT_TICK_INTERVAL} ticks. That interval is
+    // `TICK_RATE / SNAPSHOT_RATE` and must stay integral for this modulo to hold —
+    // the M8 · t8f tuning pass kept SNAPSHOT_RATE at 15 (interval 2) for exactly
+    // this reason; see the constant's doc + docs/DESIGN.md §"M8 tuning notes".
     if (this.tick % SNAPSHOT_TICK_INTERVAL === 0) {
       this.broadcastSnapshot();
     }

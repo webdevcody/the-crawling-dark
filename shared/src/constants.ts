@@ -19,7 +19,23 @@ export const TICK_RATE = 30;
 /** Milliseconds per simulation tick (derived from {@link TICK_RATE}). */
 export const TICK_MS = 1000 / TICK_RATE;
 
-/** Snapshots broadcast to clients per second. */
+/**
+ * Snapshots broadcast to clients per second.
+ *
+ * Kept at 15 after the M8 · t8f tuning pass. {@link SNAPSHOT_TICK_INTERVAL} is
+ * `TICK_RATE / SNAPSHOT_RATE` and MUST stay an integer — the server broadcasts on
+ * `tick % SNAPSHOT_TICK_INTERVAL === 0` — so with the fixed 30 Hz {@link TICK_RATE}
+ * the only attainable broadcast rates are the integer divisors of 30: 15 (every
+ * 2nd tick) or 30 (every tick). 20 is NOT reachable without also moving the sim
+ * tick, so the plan's "~15–20 Hz" collapses to those two. Raising to 30 would
+ * double snapshot bandwidth for a marginal smoothness gain now that M8 tightened
+ * the client side — fixed-timestep prediction + reconciliation error-smoothing
+ * (t8a/t8b) and the adaptive interpolation buffer + bounded extrapolation (t8d)
+ * already absorb the ~{@link SNAPSHOT_MS} gap between frames, while M7's binary +
+ * delta snapshots keep each frame tiny (~57 B typical delta). So 15 stays the
+ * recommended value (see docs/DESIGN.md §"M8 tuning notes"); 30 is the one
+ * integral step up if a future change ever needs it.
+ */
 export const SNAPSHOT_RATE = 15;
 
 /** Milliseconds between broadcast snapshots (derived from {@link SNAPSHOT_RATE}). */
@@ -34,8 +50,55 @@ export const CLIENT_FPS = 60;
 /**
  * Interpolation buffer for remote entities, in milliseconds. Remote entities
  * are rendered this far "in the past" so snapshot jitter can be smoothed.
+ *
+ * This is the *base* (seed) of the adaptive interpolation delay (M8 · t8d): when
+ * the network is calm the sampler renders about this far behind, and it widens
+ * toward {@link INTERP_DELAY_MAX_MS} as measured jitter grows. It is never the
+ * hard floor — that role belongs to {@link INTERP_DELAY_MIN_MS}.
  */
 export const INTERP_BUFFER_MS = 100;
+
+/**
+ * Lower bound (ms) for the *adaptive* interpolation delay (M8 · t8d). The render
+ * time must always sit at least one snapshot interval behind the newest snapshot
+ * so two buffered snapshots reliably straddle it and the sampler interpolates
+ * rather than extrapolates; we ask for ~1.25 intervals of margin.
+ *
+ * Deliberately expressed *relative* to {@link SNAPSHOT_MS} rather than as a bare
+ * literal: a later task (t8f) may raise {@link SNAPSHOT_RATE}, which shrinks
+ * SNAPSHOT_MS — and this floor tracks it automatically, so the band keeps
+ * comfortably straddling snapshots at whatever rate is in force. At the current
+ * SNAPSHOT_RATE (15 ⇒ SNAPSHOT_MS ≈ 66.7 ms) this is ≈ 83 ms. It sits below the
+ * {@link INTERP_BUFFER_MS} base (100 ms) — where a calm link's derived delay
+ * rests — so in normal operation it is a hard straddle-safety floor rather than
+ * the operating point: the delay only ever *widens* from the base under jitter.
+ */
+export const INTERP_DELAY_MIN_MS = SNAPSHOT_MS * 1.25;
+
+/**
+ * Upper bound (ms) for the *adaptive* interpolation delay (M8 · t8d). Under heavy
+ * jitter the delay grows to keep two snapshots straddling the render time, but
+ * past this point the added latency on remote bodies becomes perceptible, so we
+ * cap it here and let the rare late snapshot be covered by bounded extrapolation
+ * ({@link INTERP_EXTRAPOLATION_CAP_MS}) instead of buffering ever deeper. ~240 ms
+ * is a couple of snapshot intervals of headroom over the {@link INTERP_BUFFER_MS}
+ * base — enough to absorb 30–80 ms of jitter with margin.
+ */
+export const INTERP_DELAY_MAX_MS = 240;
+
+/**
+ * Maximum time (ms) the interpolator will project a remote body *past* the newest
+ * snapshot before it stops advancing (M8 · t8d). When a snapshot is late the
+ * sampler extrapolates each entity forward along the velocity implied by the two
+ * most recent snapshots, rather than freezing on the newest — which is what used
+ * to cause the visible freeze-then-jump stutter. The projection is clamped to
+ * this cap so a fully dropped snapshot can't send a body flying off; beyond the
+ * cap the extrapolated position simply holds. ~200 ms ≈ three snapshot intervals:
+ * long enough to ride out a dropped frame or a jitter spike, short enough that the
+ * worst-case overshoot (≈ {@link MOVE_SPEED_RUN} × 0.2 s ≈ 1.3 m) stays brief and
+ * is blended away the instant the next snapshot lands and interpolation resumes.
+ */
+export const INTERP_EXTRAPOLATION_CAP_MS = 200;
 
 /* -------------------------------------------------------------------------- */
 /* Movement                                                                   */
