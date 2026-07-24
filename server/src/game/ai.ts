@@ -4,10 +4,13 @@
  * A single "patient zero" NPC hunts the humans: it seeks the nearest human it
  * can perceive and steers around buildings using short look-ahead raycasts, so
  * it flows down the streets toward its prey instead of walking face-first into a
- * wall. The AI is intentionally *reactive steering*, not a planner — cheap,
- * stateless-per-tick movement that "just works" on the open street grid. The
- * known failure mode (getting wedged in a concave building pocket) is left for
- * the optional grid-A* upgrade (t4d).
+ * wall. The AI is intentionally *reactive steering* first — cheap,
+ * near-stateless movement that "just works" on the open street grid — with a
+ * grid-A* planner (t4d) layered on only as a fallback: when reactive steering
+ * demonstrably stalls (wedged in a concave building pocket, or a building parked
+ * squarely between the NPC and its prey), the NPC plans a path around the
+ * obstacle and follows it waypoint by waypoint until it can see its quarry
+ * again. See {@link NavGrid} and {@link ZombieAI.follow}.
  *
  * Separation of concerns:
  *   - This module decides WHERE the NPC wants to go (a target + a steered
@@ -34,11 +37,16 @@ import {
   AI_DETECTION_RADIUS,
   AI_CRAWL_DETECTION_MULT,
   AI_LOS_GRACE_MS,
+  NPC_CHASE_SPEED,
+  AI_STALL_ENGAGE_MS,
+  AI_STALL_PROGRESS_FRAC,
+  AI_REPATH_INTERVAL_MS,
   raycastBuildings,
   hasLineOfSight,
   type World,
 } from '@crawling-dark/shared';
 import type { Player } from './Player';
+import { NavGrid, type Waypoint } from './navgrid';
 
 /* -------------------------------------------------------------------------- */
 /* Intent + per-NPC state                                                     */
@@ -70,6 +78,24 @@ export interface AiState {
   targetId: number | null;
   /** Milliseconds since the NPC last had a clear line of sight to its target. */
   lostLosMs: number;
+
+  /* --- t4d: A* fallback bookkeeping ------------------------------------- */
+  /** Accumulated ms of "no progress" while chasing; arms the A* fallback. */
+  stallMs: number;
+  /** NPC XZ sampled last tick, used to measure how far it actually moved. */
+  prevX: number;
+  prevZ: number;
+  /** False until the first sample exists, so tick one is never a false stall. */
+  havePrev: boolean;
+  /** Active A* route (world-space waypoints), or `null` when steering directly. */
+  path: Waypoint[] | null;
+  /** Index of the current waypoint within {@link path}. */
+  pathIndex: number;
+  /** Milliseconds since {@link path} was last recomputed. */
+  repathMs: number;
+  /** Target position the live {@link path} was planned toward (for re-plan). */
+  pathGoalX: number;
+  pathGoalZ: number;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -130,11 +156,18 @@ export function yawFromDir(dx: number, dz: number): number {
 export class ZombieAI {
   private readonly world: World;
 
-  /** Per-NPC memory (target + LOS grace), keyed by NPC entity id. */
+  /**
+   * Occupancy grid + A* for the {@link follow} fallback, built once from the
+   * town. Server-only and never networked (see {@link NavGrid}).
+   */
+  private readonly nav: NavGrid;
+
+  /** Per-NPC memory (target, LOS grace, stall + path state), keyed by NPC id. */
   private readonly state = new Map<number, AiState>();
 
   constructor(world: World) {
     this.world = world;
+    this.nav = new NavGrid(world);
   }
 
   /**
@@ -152,11 +185,31 @@ export class ZombieAI {
     state.targetId = target ? target.id : null;
 
     // No prey in reach → prowl slowly toward the town centre so the NPC never
-    // strands itself against the ring wall waiting for a target to appear.
+    // strands itself against the ring wall waiting for a target to appear. Any
+    // in-progress A* plan is abandoned here — there is nothing to path to.
     if (!target) {
+      this.abandonPath(state);
+      this.trackProgress(npc, state, false, dtMs);
       const desiredYaw = this.steer(npc, -npc.move.x, -npc.move.z);
       const idle = Math.hypot(npc.move.x, npc.move.z) < 6;
       return { targetId: null, desiredYaw, moving: !idle, running: false };
+    }
+
+    // Measure whether last tick's chase actually gained ground; a long enough run
+    // of no-progress ticks is what arms the A* fallback below (t4d). A stunned
+    // NPC is held still on purpose, so its non-movement never counts as a stall.
+    const chasing = !npc.isStunned;
+    this.trackProgress(npc, state, chasing, dtMs);
+
+    // A* fallback: engaged (a live `path`) or newly armed by a sustained stall.
+    // While a plan is live we follow it around the obstacle; {@link follow}
+    // returns null the instant a clear line to the target reappears (or the route
+    // is spent / unreachable), dropping us back to cheap reactive steering.
+    if (state.path !== null || state.stallMs >= AI_STALL_ENGAGE_MS) {
+      const yaw = this.follow(npc, target, state, dtMs);
+      if (yaw !== null) {
+        return { targetId: target.id, desiredYaw: yaw, moving: true, running: true };
+      }
     }
 
     // Seek: steer the straight-line pursuit heading around any buildings.
@@ -315,11 +368,140 @@ export class ZombieAI {
     return bestYaw;
   }
 
+  /* ---------------------------------------------------------------------- */
+  /* A* fallback (t4d) — engaged only when reactive steering stalls          */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Update the per-NPC stall accumulator from how far it actually moved since the
+   * previous tick — the sole trigger for the A* fallback. While `chasing`, a tick
+   * that advances less than {@link AI_STALL_PROGRESS_FRAC} of the ground a clear
+   * run at {@link NPC_CHASE_SPEED} would cover is a stall (its `dtMs` adds to
+   * `stallMs`); a productive tick, or any tick not spent chasing (stunned, no
+   * target), resets it. The NPC's position is sampled here for next tick's
+   * comparison.
+   *
+   * Note the measurement is honest by construction: the {@link Room} integrates
+   * the NPC *after* this runs, so the displacement observed here is exactly the
+   * motion the previous tick's intent produced against real collision — if a wall
+   * ate the move, it shows up as a stall.
+   */
+  private trackProgress(
+    npc: Player,
+    state: AiState,
+    chasing: boolean,
+    dtMs: number,
+  ): void {
+    if (state.havePrev && chasing) {
+      const moved = Math.hypot(npc.move.x - state.prevX, npc.move.z - state.prevZ);
+      const expected = NPC_CHASE_SPEED * (dtMs / 1000);
+      if (moved < expected * AI_STALL_PROGRESS_FRAC) state.stallMs += dtMs;
+      else state.stallMs = 0;
+    } else {
+      state.stallMs = 0;
+    }
+    state.prevX = npc.move.x;
+    state.prevZ = npc.move.z;
+    state.havePrev = true;
+  }
+
+  /**
+   * Drive the NPC along an A* plan around whatever blocks the direct chase.
+   * Returns the steered yaw toward the current waypoint, or `null` to mean
+   * "abandon the plan and steer directly" — which happens on a clear shot at the
+   * target, a fully-consumed route, or an unreachable target.
+   *
+   * The route is (re)planned when first engaging, when it expires
+   * ({@link AI_REPATH_INTERVAL_MS}), or when the target has drifted a cell or
+   * more from where it was planned — so it tracks fleeing prey without replanning
+   * every tick. Reached waypoints are popped as the NPC arrives, and each
+   * surviving waypoint is still *approached via {@link steer}*, so body-radius
+   * wall avoidance keeps happening between the coarse grid corners (the "fall
+   * back to steering between waypoints" the task calls for).
+   */
+  private follow(
+    npc: Player,
+    target: Player,
+    state: AiState,
+    dtMs: number,
+  ): number | null {
+    // A clear straight line to the prey means the obstacle is behind us: hand
+    // control back to reactive steering, which is smoother than grid hops.
+    if (
+      hasLineOfSight(this.world, npc.move.x, npc.move.z, target.move.x, target.move.z)
+    ) {
+      this.abandonPath(state);
+      return null;
+    }
+
+    state.repathMs += dtMs;
+    const targetMoved =
+      Math.hypot(target.move.x - state.pathGoalX, target.move.z - state.pathGoalZ) >
+      this.nav.cell;
+    if (state.path === null || state.repathMs >= AI_REPATH_INTERVAL_MS || targetMoved) {
+      state.path = this.nav.findPath(
+        npc.move.x,
+        npc.move.z,
+        target.move.x,
+        target.move.z,
+      );
+      state.pathIndex = 0;
+      state.repathMs = 0;
+      state.pathGoalX = target.move.x;
+      state.pathGoalZ = target.move.z;
+      if (state.path === null) {
+        // No route (target boxed in, or genuinely unreachable). Stop hammering
+        // the planner every tick and let steering do its best from here.
+        state.stallMs = 0;
+        return null;
+      }
+    }
+
+    const path = state.path;
+    if (path === null) return null;
+
+    // Pop waypoints already reached (within a cell). The final waypoint is the
+    // target's own cell, so consuming it means we've effectively arrived.
+    const arrive = this.nav.cell;
+    while (state.pathIndex < path.length) {
+      const wp = path[state.pathIndex];
+      if (Math.hypot(wp.x - npc.move.x, wp.z - npc.move.z) <= arrive) state.pathIndex++;
+      else break;
+    }
+    if (state.pathIndex >= path.length) {
+      this.abandonPath(state);
+      return null; // route consumed — we're on top of the target's cell.
+    }
+
+    const wp = path[state.pathIndex];
+    return this.steer(npc, wp.x - npc.move.x, wp.z - npc.move.z);
+  }
+
+  /** Drop any active A* plan and clear the stall counter that armed it. */
+  private abandonPath(state: AiState): void {
+    state.path = null;
+    state.pathIndex = 0;
+    state.repathMs = 0;
+    state.stallMs = 0;
+  }
+
   /** Fetch (or lazily create) the persistent state record for one NPC. */
   private stateFor(npcId: number): AiState {
     let s = this.state.get(npcId);
     if (s === undefined) {
-      s = { targetId: null, lostLosMs: 0 };
+      s = {
+        targetId: null,
+        lostLosMs: 0,
+        stallMs: 0,
+        prevX: 0,
+        prevZ: 0,
+        havePrev: false,
+        path: null,
+        pathIndex: 0,
+        repathMs: 0,
+        pathGoalX: 0,
+        pathGoalZ: 0,
+      };
       this.state.set(npcId, s);
     }
     return s;
