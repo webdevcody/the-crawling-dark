@@ -1,0 +1,265 @@
+# 🧟 The Crawling Dark — Design of Record
+
+> This document is the design of record for The Crawling Dark, copied from the detailed plan in issue #1.
+
+## Detailed Implementation Plan
+
+Here's a fleshed-out plan for the game described in the issue. It locks down the fuzzy rules into concrete, tunable numbers, proposes an authoritative-server architecture, and breaks the work into shippable milestones. Anything marked **⚠️ Decision needed** is a spot where I made a reasonable default but want your call.
+
+---
+
+### 1. Game design — locking down the rules
+
+**Concept.** Up to ~12 players spawn in a dark town. One NPC zombie ("patient zero") hunts them. Survive **5 minutes** and the humans win. Get caught and you *join the horde* — the longer the round runs, the more dangerous it gets. If everyone is turned, the zombies win.
+
+**Player states & controls**
+
+| Action | Key | Behavior |
+|---|---|---|
+| Walk | `W A S D` | Default move, ~3.5 m/s |
+| Run | hold `Shift` | ~6.5 m/s, drains stamina (⚠️ stamina optional — see below) |
+| Crawl | hold `C` (toggle) | ~1.5 m/s, low profile: smaller hitbox, quieter, can slip under some obstacles |
+| Jump | `Space` | ~1.2 m impulse, can't change state mid-air |
+| Attack | `Left click` | Baseball-bat swing, ~120° arc, short range, cooldown |
+| Look | mouse | Camera / aim |
+
+**Combat rules**
+- **Zombies infect, they don't "kill."** A zombie that lands a hit on a human downs them; after a short death-cam the player **respawns as a zombie on the zombie team** for the rest of the round.
+- **Zombies have infinite lives.** So the bat can't permanently remove a zombie. Instead the bat is a **defensive/crowd-control tool**: a hit **knocks the zombie back and stuns it** for ~1.5s, buying time to escape. This keeps the human win-condition purely about *survival*, not *kills*.
+- **Crawling is stealth.** Zombies acquire targets partly by line-of-sight; crawlers are harder to spot and present a smaller hitbox — the risk is you're slow. (Fits the "Crawling Dark" theme.)
+
+**Zombie behavior**
+- Round starts with **1 NPC zombie**. The horde grows only from turned players.
+- NPC AI: seek the nearest visible human, path around buildings, attack on contact. Turned-player zombies are human-controlled with the same movement set (minus the bat; they get a lunge/claw attack).
+
+**Round lifecycle**
+
+```
+LOBBY ──(≥2 players ready)──▶ COUNTDOWN(10s) ──▶ ACTIVE(5:00) ──▶ ROUND_END(10s) ──▶ LOBBY
+```
+- **Humans win** if the 5:00 timer expires with ≥1 human alive.
+- **Zombies win** if all humans are turned before the timer expires.
+- On death → become zombie (no spectating unless you're already out and the round has no humans left).
+
+**⚠️ Decisions needed**
+1. **Stamina on sprint?** (Adds depth; adds tuning work.) Default: *yes, simple stamina bar.*
+2. **Camera:** first-person or third-person? Default: *third-person over-the-shoulder* (easier to read the bat swing and see zombies behind you).
+3. **Player count / rooms:** single shared game room for MVP, or matchmaking into rooms of N? Default: *single room, cap 12, spillover spectates.*
+4. **Friendly fire / bat vs other humans?** Default: *no friendly fire.*
+5. **Respawn-as-zombie delay** and whether turned zombies can be bat-stunned too. Default: *3s delay, yes they can be stunned.*
+
+---
+
+### 2. Technical architecture
+
+**Authoritative server.** The server owns all game state and simulates movement, collision, combat, AI, and the round clock. Clients send *inputs*, receive *state snapshots*. This prevents cheating (speed/teleport/hit hacks) and keeps everyone in sync — essential for a PvP infection game.
+
+**Rates**
+- Server simulation tick: **30 Hz** (33 ms fixed timestep).
+- Snapshot broadcast: **~15–20 Hz** (delta-compressed later).
+- Client render: **60 fps** with **~100 ms interpolation buffer** for remote entities.
+
+**Latency hiding**
+- **Client-side prediction** for the local player (apply your own input immediately, reconcile against server).
+- **Entity interpolation** for everyone else (render them slightly in the past, smoothly).
+- MVP can ship with *interpolation only* and add prediction in a later milestone if input feels laggy.
+
+**Stack**
+
+| Layer | Choice | Why |
+|---|---|---|
+| Language | **TypeScript** everywhere | Shared types across client/server catch protocol drift |
+| Client render | **Three.js** (r160+) | As requested |
+| Client build | **Vite** | Fast dev server + HMR |
+| Server | **Node.js + `ws`** | Simple, battle-tested WebSocket lib; swap to `uWebSockets.js` if we need more throughput |
+| Shared | workspace `shared/` package | Constants, message types, and pure sim math reused by both sides |
+| Monorepo | **pnpm workspaces** | Clean client/server/shared separation |
+
+**Repo layout**
+
+```
+the-crawling-dark/
+├─ package.json            # pnpm workspace root
+├─ shared/                 # imported by both client & server
+│  ├─ constants.ts         # tick rate, speeds, map size, round length
+│  ├─ protocol.ts          # message type enums + payload interfaces
+│  ├─ math.ts              # vec3 helpers, collision primitives
+│  └─ sim.ts               # pure movement/collision step (shared by predict + server)
+├─ server/
+│  ├─ index.ts             # ws server, connection lifecycle
+│  ├─ game/
+│  │  ├─ Room.ts           # one game instance, tick loop
+│  │  ├─ Player.ts, Zombie.ts
+│  │  ├─ ai.ts             # zombie steering/pathfinding
+│  │  ├─ round.ts          # state machine + timer
+│  │  └─ world.ts          # town geometry + collision queries
+│  └─ net/encode.ts        # snapshot (de)serialization
+├─ client/
+│  ├─ index.html
+│  ├─ main.ts              # bootstrap
+│  ├─ net/Connection.ts    # ws client, reconnect, ping
+│  ├─ scene/              # renderer, camera, lighting, fog
+│  ├─ entities/           # player/zombie meshes + animation
+│  ├─ input/Controls.ts    # keybinds → input frames
+│  ├─ predict/            # local prediction + reconciliation
+│  └─ ui/HUD.ts            # timer, alive count, team, stamina
+└─ docs/DESIGN.md          # this plan, kept in-repo
+```
+
+---
+
+### 3. Network protocol
+
+JSON to start (readable, fast to build); a clear path to binary/delta later. Every message is `{ t: <type>, ...payload }`.
+
+**Client → Server**
+```ts
+JOIN     { name: string }
+INPUT    { seq: number, keys: bitmask, yaw: number, dt: number }  // sent every client frame
+ATTACK   { seq: number }                                          // bat swing
+READY    { ready: boolean }                                        // lobby
+PING     { id: number }
+```
+
+**Server → Client**
+```ts
+WELCOME    { playerId, tickRate, mapSeed }
+SNAPSHOT   { tick, entities: [{ id, kind, x,y,z, yaw, state, hp/turned }], events: [...] }
+EVENT      { kind: 'attack'|'infect'|'stun'|'jump'|'roundStart'|'roundEnd', ... }
+ROUND      { phase, timeLeftMs, humansAlive, zombieCount, winner? }
+PONG       { id }
+```
+
+`INPUT` uses a **bitmask** for held keys (fwd/back/left/right/run/crawl/jump) plus `yaw` and a client `seq` number the server echoes in snapshots so prediction can reconcile.
+
+**Optimization path (later milestone):** switch payloads to `ArrayBuffer`, quantize positions to 16-bit, delta-encode against last acked snapshot, and only send entities in interest range. Not needed for MVP correctness.
+
+---
+
+### 4. World & collision
+
+- **Town** = a bounded grid of building AABBs (boxes) around streets and a central square, with a perimeter wall so no one runs off the map. Built from a seed so client and server agree.
+- **2.5D collision** (big simplification): players are cylinders on a flat ground plane; collision is resolved as circle-vs-AABB on the **XZ plane**, with `Y` handled separately for jump gravity. This avoids a full 3D physics engine while still feeling solid.
+- MVP uses box meshes for buildings; swap in GLTF town assets later without touching collision (collision reads the same AABB list).
+
+---
+
+### 5. Server simulation
+
+**Fixed-timestep loop** (`setInterval` at 30 Hz, accumulator for drift):
+1. Drain queued client inputs.
+2. Step each player: apply movement from `sim.ts`, resolve collisions, gravity/jump.
+3. Step zombie AI (seek + avoid + attack).
+4. Resolve bat swings (arc/cone hit test → stun+knockback).
+5. Resolve infections (zombie contact with human → schedule turn).
+6. Advance round state machine + timer, check win/lose.
+7. Every ~2nd tick: build & broadcast a snapshot.
+
+**Zombie AI (MVP):** steering — seek nearest *visible* human, avoid buildings via short raycasts, attack when within contact range. Upgrade to **grid A\*** over a nav grid if steering gets stuck on concave corners.
+
+**Combat resolution:** bat swing = cone test (range + half-angle) against zombies in front; on hit apply knockback impulse + stun timer. Infection = capsule overlap between a zombie and a human during the zombie's attack window.
+
+---
+
+### 6. Client
+
+- **Scene:** dark ambient + a few street lights, **fog** for the "crawling dark" mood and to hide pop-in, moon/directional light for shape.
+- **Camera:** third-person spring-arm that avoids clipping into walls.
+- **Entities:** capsule/box placeholders first, then rigged GLTF with animation states (idle/walk/run/crawl/jump/swing). Remote entities interpolated from the snapshot buffer.
+- **Input:** poll keys each frame → build an `INPUT` frame with a `seq`, send to server, and (once prediction lands) apply locally immediately.
+- **HUD:** round timer, humans-alive count, your team, stamina bar, and a kill/turn feed.
+
+---
+
+### 7. Milestones (each independently demoable)
+
+| # | Milestone | Acceptance criteria | Rough size |
+|---|---|---|---|
+| **M0** | Scaffold | pnpm workspace, Vite client shows a Three.js scene, `ws` server accepts a connection, shared package imports on both sides | S |
+| **M1** | Networking spine | Join/leave, player IDs, snapshot broadcast, ping/RTT display; two browser tabs see each other as boxes moving | M |
+| **M2** | Movement & world | Town map, walk/run/crawl/jump with server-side collision, remote interpolation, third-person camera | L |
+| **M3** | Combat & infection | Bat swing (stun+knockback), zombie contact turns humans, death→zombie flow | M |
+| **M4** | Zombie AI | NPC patient-zero seeks/paths/attacks; feels threatening but escapable | M |
+| **M5** | Round loop | Lobby→countdown→5:00 active→end, win/lose conditions, HUD timer + alive count | M |
+| **M6** | Prediction & polish | Client prediction + reconciliation, stamina, animations, audio, fog/lighting pass | L |
+| **M7** | Netcode optimization | Binary/delta snapshots, interest management, reconnect | M *(optional for a fun MVP)* |
+
+A **playable-fun MVP is M0–M5.** M6–M7 make it feel good and scale.
+
+---
+
+### 8. Risks & mitigations
+- **Netcode complexity** → start interpolation-only; add prediction in M6, not M0.
+- **Zombie pathing getting stuck** → ship steering first, keep A\* as a known upgrade.
+- **Scope creep on art** → box placeholders gate every gameplay milestone; art is swappable and never blocks logic.
+- **Physics rabbit hole** → deliberately 2.5D, no full physics engine.
+
+---
+
+### 9. Suggested first PR (M0)
+Set up the pnpm monorepo, a Vite Three.js client rendering a lit ground plane, a `ws` server that logs connects, and a `shared/constants.ts` both import — proving the whole toolchain end-to-end before any gameplay.
+
+---
+
+## Constants reference
+
+The tunables below are defined once in `shared/src/constants.ts` and imported by
+both the client and the server, so changing a value here changes it everywhere
+without duplication. Values match the "locked" numbers above.
+
+### Simulation & networking rates
+
+| Constant | Meaning | Value |
+|---|---|---|
+| `TICK_RATE` | Server simulation ticks per second (fixed timestep) | `30` |
+| `TICK_MS` | Milliseconds per simulation tick (derived) | `1000 / TICK_RATE` ≈ `33.33` |
+| `SNAPSHOT_RATE` | Snapshots broadcast to clients per second | `15` |
+| `SNAPSHOT_MS` | Milliseconds between snapshots (derived) | `1000 / SNAPSHOT_RATE` ≈ `66.67` |
+| `SNAPSHOT_TICK_INTERVAL` | Sim ticks between snapshots (derived) | `2` |
+| `CLIENT_FPS` | Target client render frame rate | `60` |
+| `INTERP_BUFFER_MS` | Remote-entity interpolation buffer (ms) | `100` |
+
+### Movement
+
+| Constant | Meaning | Value |
+|---|---|---|
+| `MOVE_SPEED_CRAWL` | Crawl speed (m/s) | `1.5` |
+| `MOVE_SPEED_WALK` | Walk speed (m/s) | `3.5` |
+| `MOVE_SPEED_RUN` | Run speed (m/s) | `6.5` |
+| `JUMP_VELOCITY` | Upward jump velocity (m/s, ~1.2 m peak) | `6.6` |
+| `GRAVITY` | Downward acceleration (m/s²) | `18.0` |
+| `PLAYER_RADIUS` | Collision cylinder radius (m) | `0.4` |
+| `PLAYER_HEIGHT` | Standing capsule height (m) | `1.8` |
+| `CRAWL_HEIGHT` | Crawling capsule height (m) | `0.9` |
+
+### Combat & infection
+
+| Constant | Meaning | Value |
+|---|---|---|
+| `ATTACK_COOLDOWN_MS` | Cooldown between bat swings (ms) | `800` |
+| `BAT_RANGE` | Bat swing reach from attacker (m) | `2.0` |
+| `BAT_ARC_DEG` | Full bat swing cone width (degrees) | `120` |
+| `STUN_DURATION_MS` | Stun applied by a bat hit (ms) | `1500` |
+| `BAT_KNOCKBACK` | Knockback impulse on a bat hit (m/s) | `8.0` |
+| `INFECTION_CONTACT_RADIUS` | Zombie-to-human infection radius (m) | `1.0` |
+| `RESPAWN_DELAY_MS` | Delay before a downed human turns zombie (ms) | `3000` |
+
+### Round lifecycle
+
+| Constant | Meaning | Value |
+|---|---|---|
+| `MIN_PLAYERS_TO_START` | Ready players required to start | `2` |
+| `MAX_PLAYERS` | Max players per room (spillover spectates) | `12` |
+| `COUNTDOWN_SEC` | Pre-round countdown (s) | `10` |
+| `COUNTDOWN_MS` | Pre-round countdown (ms, derived) | `10000` |
+| `ROUND_LENGTH_SEC` | Active round length (s, 5:00) | `300` |
+| `ROUND_LENGTH_MS` | Active round length (ms, derived) | `300000` |
+| `ROUND_END_SEC` | Post-round scoreboard length (s) | `10` |
+| `ROUND_END_MS` | Post-round scoreboard length (ms, derived) | `10000` |
+
+### World & server
+
+| Constant | Meaning | Value |
+|---|---|---|
+| `MAP_SIZE` | Square town size in world units (spans ±MAP_SIZE/2 on X/Z) | `128` |
+| `DEFAULT_SERVER_PORT` | Default authoritative WebSocket server port | `8080` |
