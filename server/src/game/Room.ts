@@ -474,20 +474,58 @@ export class Room {
   }
 
   /**
-   * Decide whether the NPC claws this tick — t4c EXTENSION POINT.
+   * Decide whether the NPC claws this tick — t4c EXTENSION POINT (now wired).
    *
-   * t4a ships this as a no-op: the NPC hunts but cannot yet turn anyone. t4c
-   * fills it in so that when a human is within {@link NPC_ATTACK_RANGE} and the
-   * NPC is off cooldown and un-stunned, it latches `pendingAttack` (and starts
-   * {@link ATTACK_COOLDOWN_MS}) exactly as a client ATTACK would — reusing the
-   * existing {@link resolveAttacks} -> {@link resolveInfections} turn flow so an
-   * NPC claw infects identically to a player zombie's. Speed/aggro tuning lives
-   * here too. Contained to the Room so it never overlaps the targeting work in
-   * `ai.ts`.
+   * When a live human is within {@link NPC_ATTACK_RANGE} and the NPC is off
+   * cooldown and un-stunned, this latches `pendingAttack` and starts
+   * {@link ATTACK_COOLDOWN_MS} — byte-for-byte what a client ATTACK does in
+   * {@link handleMessage}. It deliberately does NOTHING else: it neither opens
+   * the claw window nor infects anyone directly. Instead, this very tick,
+   * {@link resolveAttacks} opens the window (and buffers the swing VFX) and
+   * {@link resolveInfections} turns any human inside
+   * {@link INFECTION_CONTACT_RADIUS}. Routing the NPC through that existing
+   * resolveAttacks -> resolveInfections flow is the whole point: an NPC claw
+   * infects through the IDENTICAL path a player zombie uses, so there is no
+   * second infection implementation to keep in sync. Speed/aggro tuning lives
+   * here too, and it stays inside the Room so it never overlaps the targeting
+   * work in `ai.ts`.
    */
   private decideNpcAttack(npc: Player, humans: readonly Player[]): void {
-    void npc;
-    void humans;
+    // Gate exactly like MessageType.Attack: a stunned zombie can't act and the
+    // cooldown throttles claw spam. The NPC is never a spectator and is never
+    // `down` here, so those two ATTACK guards are implicitly satisfied already.
+    if (npc.isStunned || npc.attackCooldownMs > 0) return;
+
+    // Only commit when a human is actually in reach — otherwise the NPC would
+    // burn its cooldown clawing at empty street. This is the ATTACK-INITIATION
+    // test; the actual turn still hinges on INFECTION_CONTACT_RADIUS downstream.
+    if (!this.humanInClawRange(npc, humans)) return;
+
+    // Latch for THIS tick and start the cooldown — the same two lines the client
+    // ATTACK runs (see handleMessage). resolveAttacks()/resolveInfections(),
+    // both later in step(), then do the rest through the shared flow above.
+    npc.pendingAttack = true;
+    npc.attackCooldownMs = ATTACK_COOLDOWN_MS;
+  }
+
+  /**
+   * Whether any live human sits within claw reach of the NPC on the XZ plane.
+   * Distance is centre-to-centre against {@link NPC_ATTACK_RANGE} — the attack
+   * INITIATION radius, intentionally a touch wider than the
+   * {@link INFECTION_CONTACT_RADIUS} that {@link resolveInfections} requires to
+   * actually turn someone — so the NPC commits its claw a hair before contact,
+   * just as a human would tap ATTACK on the approach. Compared in squared space
+   * to skip a per-candidate square root; `humans` is already the live,
+   * infectable set (see {@link liveHumans}), so no team/down re-check is needed.
+   */
+  private humanInClawRange(npc: Player, humans: readonly Player[]): boolean {
+    const r2 = NPC_ATTACK_RANGE * NPC_ATTACK_RANGE;
+    for (const human of humans) {
+      const dx = human.move.x - npc.move.x;
+      const dz = human.move.z - npc.move.z;
+      if (dx * dx + dz * dz <= r2) return true;
+    }
+    return false;
   }
 
   /**

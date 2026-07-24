@@ -201,21 +201,76 @@ export class ZombieAI {
     state: AiState,
     dtMs: number,
   ): Player | null {
-    void state;
-    void dtMs;
+    // --- Sticky pursuit: try to hold onto the human we're already hunting. ---
+    // Committing to one quarry (rather than re-picking the nearest every tick)
+    // gives stable, readable chases and lets the grace timer below bridge brief
+    // sight breaks.
+    if (state.targetId !== null) {
+      const current = humans.find((h) => h.id === state.targetId) ?? null;
+      if (current === null) {
+        // Quarry left the live set (disconnected / downed / turned zombie).
+        // There's nothing to pursue, so drop it and re-acquire below.
+      } else if (this.isVisible(npc, current)) {
+        // Still in plain sight: refresh the grace timer and stay locked on, even
+        // if some other human is momentarily closer. Chasing whoever is nearest
+        // each tick makes the NPC dither whenever two humans cross paths.
+        state.lostLosMs = 0;
+        return current;
+      } else {
+        // Lost sight this tick. Keep pursuing its last-known position until the
+        // grace period is spent, so a human who ducks behind a wall for a beat
+        // doesn't instantly shake the hunter.
+        state.lostLosMs += dtMs;
+        if (state.lostLosMs <= AI_LOS_GRACE_MS) return current;
+        // Grace exhausted — the trail's gone cold; fall through and re-acquire.
+      }
+    }
 
-    let nearest: Player | null = null;
-    let nearestD2 = Infinity;
+    // --- Acquire: the nearest human this NPC can actually perceive right now. ---
+    let best: Player | null = null;
+    let bestD2 = Infinity;
     for (const human of humans) {
+      if (!this.isVisible(npc, human)) continue;
       const dx = human.move.x - npc.move.x;
       const dz = human.move.z - npc.move.z;
       const d2 = dx * dx + dz * dz;
-      if (d2 < nearestD2) {
-        nearestD2 = d2;
-        nearest = human;
+      if (d2 < bestD2) {
+        bestD2 = d2;
+        best = human;
       }
     }
-    return nearest;
+    // A fresh lock (or an empty scan) starts with a clean grace timer: it only
+    // ever measures unbroken occlusion of a *held* target, never the search.
+    state.lostLosMs = 0;
+    return best;
+  }
+
+  /**
+   * Whether the NPC can perceive `human` this instant — the atomic test behind
+   * both sticky pursuit and re-acquisition. A human is visible only when it is
+   * within its own detection radius AND no building occludes the sightline.
+   *
+   * The radius shrinks for a crawling human ({@link AI_CRAWL_DETECTION_MULT}),
+   * which — together with the {@link hasLineOfSight} occlusion check — is what
+   * makes the acceptance criterion hold: a crawler behind cover is spotted far
+   * less readily than someone running upright in the open, because it must be
+   * both much closer (smaller radius) and in an unbroken line of sight.
+   */
+  private isVisible(npc: Player, human: Player): boolean {
+    const radius =
+      human.move.crawling === true
+        ? AI_DETECTION_RADIUS * AI_CRAWL_DETECTION_MULT
+        : AI_DETECTION_RADIUS;
+    const dx = human.move.x - npc.move.x;
+    const dz = human.move.z - npc.move.z;
+    if (dx * dx + dz * dz > radius * radius) return false;
+    return hasLineOfSight(
+      this.world,
+      npc.move.x,
+      npc.move.z,
+      human.move.x,
+      human.move.z,
+    );
   }
 
   /* ---------------------------------------------------------------------- */
