@@ -158,11 +158,38 @@ const STREET_HALF = 3.0;
 const MIN_HALF_EXTENT = 2.5;
 const MAX_HALF_EXTENT = 5.5;
 
-/** Building render heights are randomized within this closed range (meters). */
-const MIN_BUILDING_HEIGHT = 4.0;
-const MAX_BUILDING_HEIGHT = 14.0;
+/* --- M9 · t9b: district building profile (small houses → skyscrapers) ----- */
 
-/* --- M9 · t9a: natural/urban feature tunables ----------------------------- */
+/**
+ * The town reads as a real city by grading building height + footprint with a
+ * block's distance from the core (t9b). A block's "district" is a 0→1 factor of
+ * `max(|cx|,|cz|)` (its Chebyshev distance to the origin): 0 at/inside
+ * {@link DISTRICT_CORE_EDGE} (downtown), 1 at/outside {@link DISTRICT_RIM_EDGE}
+ * (outskirts). For the 6×6 grid, surviving block centres sit at `|center|` ∈
+ * {27, 45} (the innermost `|center| = 9` ring always falls inside the plaza and
+ * is dropped), so these edges split the map cleanly into a **tower core** at 27
+ * and a **house rim** at 45.
+ */
+const DISTRICT_CORE_EDGE = 27.0;
+const DISTRICT_RIM_EDGE = 45.0;
+
+/** Core (downtown) building height range — tall towers (meters). */
+const CORE_MIN_HEIGHT = 16.0;
+const CORE_MAX_HEIGHT = 44.0;
+
+/** Rim (outskirts) building height range — small houses (meters). */
+const RIM_MIN_HEIGHT = 3.5;
+const RIM_MAX_HEIGHT = 8.0;
+
+/**
+ * Footprint scale by district: rim houses are smaller than core towers. Always
+ * ≤ 1, so a scaled footprint can only shrink — it never breaches the per-cell
+ * street-clearance bound that keeps buildings out of the streets.
+ */
+const CORE_FOOT_SCALE = 1.0;
+const RIM_FOOT_SCALE = 0.6;
+
+/* --- M9 · t9a/t9d: lake tunables (t9d widens it a touch for presence) ------ */
 
 /**
  * The world's water interaction rule. M9 picks `'blocked'`: the lake is a solid
@@ -172,43 +199,58 @@ const MAX_BUILDING_HEIGHT = 14.0;
 const WATER_MODE: WaterMode = 'blocked';
 
 /** Lake radius range (meters). */
-const MIN_LAKE_RADIUS = 7.0;
-const MAX_LAKE_RADIUS = 10.0;
+const MIN_LAKE_RADIUS = 8.0;
+const MAX_LAKE_RADIUS = 12.0;
 
 /**
  * The lake center is placed on a ring this far (meters) from the origin. The
  * bounds guarantee the whole disc clears the {@link PLAZA_RADIUS} plaza on the
- * inside (ring−radius ≥ 18 > 12) and stays inside {@link TOWN_HALF} on the
- * outside (ring+radius ≤ 50 < 54), so it never seals off the perimeter band.
+ * inside (ring−radius ≥ 16 > 12) and stays well inside {@link TOWN_HALF} on the
+ * outside (ring+radius ≤ 50 < 54), so it neither reaches the spawn plaza nor the
+ * perimeter forest band, and the road grid still routes around it.
  */
 const LAKE_RING_MIN = 28.0;
-const LAKE_RING_MAX = 40.0;
+const LAKE_RING_MAX = 38.0;
+
+/* --- M9 · t9c: dense perimeter forest ------------------------------------- */
 
 /** Tree collision/trunk radius range (meters). */
-const MIN_TREE_RADIUS = 0.5;
-const MAX_TREE_RADIUS = 0.9;
+const MIN_TREE_RADIUS = 0.75;
+const MAX_TREE_RADIUS = 1.05;
 
 /** Tree render height range (meters). */
-const MIN_TREE_HEIGHT = 4.0;
-const MAX_TREE_HEIGHT = 9.0;
+const MIN_TREE_HEIGHT = 5.0;
+const MAX_TREE_HEIGHT = 11.0;
 
 /**
- * Baseline boundary-forest layout: two loose concentric rings of trees in the
- * band just inside the perimeter wall, at these radii (meters) from the origin.
- * A circular ring lines the map's mid-edges while leaving the square's *corners*
- * open — which is exactly where the NPC zombie spawns (`half − 5` on both axes,
- * a Cartesian corner far outside these radii) — so the baseline never fouls that
- * spawn. This is deliberately sparse; M9 · t9c packs the full, walk-through-proof
- * perimeter forest on top of the same {@link Tree} model.
+ * Dense perimeter forest (t9c). Instead of the sparse boundary rings t9a shipped,
+ * a thick band of solid trees fills the square annulus from just OUTSIDE the ring
+ * road out to the wall clamp, so the map edge reads as a wall of forest and is
+ * walk-through-proof — the perimeter clamp stays as an invisible backstop hidden
+ * behind the trees. Trees are packed on a fixed grid (spacing {@link FOREST_STEP},
+ * per-tree {@link FOREST_JITTER}) over the band; at this spacing and trunk radius
+ * the surface gap between neighbours stays under a player's diameter even at the
+ * worst jitter, and the band is several rows deep, so no straight path threads it.
  */
-const TREE_RING_INNER = TOWN_HALF + 2.0; // ~56 m — just outside the outermost buildings
-const TREE_RING_OUTER = MAP_SIZE / 2 - WALL_THICKNESS - 3.5; // ~59.5 m — clear of the wall clamp
-/** Trees per ring before rejection (angular slots; some are dropped near the lake). */
-const TREES_PER_RING = 36;
-/** Radial jitter (± meters) applied to each ring tree so the band doesn't read as a fence. */
-const TREE_RING_JITTER = 1.0;
-/** Keep trees this far (meters) clear of the lake and of building footprints. */
+const FOREST_BAND_INNER = TOWN_HALF + 4.0; // ~58 m — just past the ring road's outer edge
+const FOREST_STEP = 1.4; // candidate grid spacing (m); tight enough to be impassable
+const FOREST_JITTER = 0.35; // per-tree positional jitter (± m) so it isn't a bare lattice
+/** Keep the forest this far (meters) clear of the lake shoreline. */
 const TREE_CLEARANCE = 0.75;
+
+/**
+ * Distance (meters) the NPC "patient zero" spawns inside each map corner — it is
+ * placed at `(half − NPC_SPAWN_INSET, half − NPC_SPAWN_INSET)` by the server (see
+ * `Room.spawnNpcZombie`). Mirrored here so the forest can leave that corner clear.
+ */
+const NPC_SPAWN_INSET = 5.0;
+
+/**
+ * Radius (meters) of the clearing kept free of forest around the NPC spawn corner,
+ * so the zombie never wakes wedged inside the tree wall (the wall clamp still
+ * contains it there). Comfortably larger than {@link NPC_SPAWN_INSET}'s slack.
+ */
+const NPC_SPAWN_CLEARING = 7.5;
 
 /* -------------------------------------------------------------------------- */
 /* Deterministic PRNG                                                         */
@@ -286,10 +328,11 @@ function generateLake(rng: () => number): Lake {
 }
 
 /**
- * Emit the decorative interior street grid: one lane along each *interior* block
- * boundary on both axes (the outer boundaries are the town edge, left for the
- * ring road that M9 · t9b adds). Purely structural, so fully deterministic
- * without touching the PRNG. Non-colliding.
+ * Emit the decorative street network (t9b): one lane along each *interior* block
+ * boundary on both axes, plus a **ring road** — a closed loop tracing the town's
+ * outer boundary at ±TOWN_HALF that ties every interior lane's ends together and
+ * fronts the perimeter forest. Purely structural, so fully deterministic without
+ * touching the PRNG. Non-colliding (render/layout data only).
  */
 function generateRoads(): Road[] {
   const roads: Road[] = [];
@@ -301,41 +344,78 @@ function generateRoads(): Road[] {
     roads.push({ points: [{ x: c, z: -TOWN_HALF }, { x: c, z: TOWN_HALF }], width });
     roads.push({ points: [{ x: -TOWN_HALF, z: c }, { x: TOWN_HALF, z: c }], width });
   }
+  // Ring road: one closed loop around the town boundary connecting the lanes.
+  const r = TOWN_HALF;
+  roads.push({
+    points: [
+      { x: -r, z: -r },
+      { x: r, z: -r },
+      { x: r, z: r },
+      { x: -r, z: r },
+      { x: -r, z: -r },
+    ],
+    width,
+  });
   return roads;
 }
 
 /**
- * Deterministically place the baseline boundary forest: two loose concentric
- * rings of solid trees just inside the perimeter (see {@link TREE_RING_INNER}/
- * {@link TREE_RING_OUTER}). Each angular slot's bearing, radius jitter, trunk
- * radius, and height are drawn from `rng` (4 values per slot, always consumed so
- * the stream stays aligned even when a slot is dropped). A slot is dropped only
- * when it would fall inside the wall clamp or overlap the lake. Trees at these
- * radii already clear every building footprint (which end by ~TOWN_HALF).
+ * Deterministically pack the dense perimeter forest (t9c): a thick band of solid
+ * trees filling the square annulus between {@link FOREST_BAND_INNER} and the wall
+ * clamp, so the map edge is a walk-through-proof wall of forest rather than a bare
+ * slab (the perimeter clamp survives as an invisible backstop behind the trees).
+ *
+ * Candidates are stepped on a fixed {@link FOREST_STEP} grid over the bounding
+ * square; each draws four PRNG values (x/z jitter, trunk radius, height) — ALWAYS
+ * consumed, even when the candidate is later rejected, so the stream stays aligned
+ * regardless of where the lake landed. A candidate is kept only when its
+ * (jittered) centre lands in the band on `max(|x|,|z|)` (Chebyshev distance, so
+ * the band hugs the *square* edge uniformly, corners included), outside the NPC
+ * spawn clearing, and clear of the lake. At this spacing/radius the neighbour
+ * surface gap stays under a player's diameter and the band is several rows deep,
+ * so no straight path threads it.
  */
 function generateTrees(rng: () => number, water: Lake | null): Tree[] {
   const trees: Tree[] = [];
   let id = 0;
   const wallLimit = MAP_SIZE / 2 - WALL_THICKNESS - MAX_TREE_RADIUS - 0.5;
-  const rings = [TREE_RING_INNER, TREE_RING_OUTER];
-  for (const baseR of rings) {
-    for (let i = 0; i < TREES_PER_RING; i++) {
-      // Evenly spaced bearing with a little jitter so the ring isn't a fence.
-      const angle = (i / TREES_PER_RING) * Math.PI * 2 + (rng() * 2 - 1) * 0.06;
-      const r = baseR + (rng() * 2 - 1) * TREE_RING_JITTER;
+  // Keep the NPC "patient zero" spawn corner (half − inset on both axes) clear.
+  const npcX = MAP_SIZE / 2 - NPC_SPAWN_INSET;
+  const npcZ = npcX;
+  const clearingSq = NPC_SPAWN_CLEARING * NPC_SPAWN_CLEARING;
+
+  const start = -wallLimit;
+  const steps = Math.floor((2 * wallLimit) / FOREST_STEP);
+  for (let gi = 0; gi <= steps; gi++) {
+    const baseX = start + gi * FOREST_STEP;
+    for (let gj = 0; gj <= steps; gj++) {
+      const baseZ = start + gj * FOREST_STEP;
+      // Draw all four values up front so the PRNG stream never depends on which
+      // candidates are rejected below (keeps the forest identical per seed).
+      const x = baseX + (rng() * 2 - 1) * FOREST_JITTER;
+      const z = baseZ + (rng() * 2 - 1) * FOREST_JITTER;
       const radius = MIN_TREE_RADIUS + rng() * (MAX_TREE_RADIUS - MIN_TREE_RADIUS);
       const height = MIN_TREE_HEIGHT + rng() * (MAX_TREE_HEIGHT - MIN_TREE_HEIGHT);
-      const x = Math.cos(angle) * r;
-      const z = Math.sin(angle) * r;
-      // Stay inside the wall clamp so the player can never be pushed into the wall.
-      if (Math.abs(x) > wallLimit || Math.abs(z) > wallLimit) continue;
-      // Never grow a tree in the water.
+
+      // Square annulus: keep only the band just past the ring road, out to the
+      // wall clamp (so a tree can never be pushed into / past the wall).
+      const cheb = Math.abs(x) > Math.abs(z) ? Math.abs(x) : Math.abs(z);
+      if (cheb < FOREST_BAND_INNER || cheb > wallLimit) continue;
+
+      // Leave the NPC spawn corner an open clearing.
+      const ndx = x - npcX;
+      const ndz = z - npcZ;
+      if (ndx * ndx + ndz * ndz < clearingSq) continue;
+
+      // Never grow a tree in the water (the lake never reaches this band with the
+      // current tunables, but keep the guard robust to future lake tweaks).
       if (water !== null) {
         const dx = x - water.cx;
         const dz = z - water.cz;
         const keep = water.radius + radius + TREE_CLEARANCE;
         if (dx * dx + dz * dz < keep * keep) continue;
       }
+
       trees.push({ id: id++, x, z, radius, height });
     }
   }
@@ -352,14 +432,17 @@ function generateTrees(rng: () => number, water: Lake | null): Tree[] {
  * with its footprint and height jittered by the PRNG for character but always
  * kept inside the block's inner area (leaving STREET_HALF clearance to every
  * cell edge) — so buildings never overlap each other and never spill into the
- * streets between them. Any candidate whose footprint would reach inside the
- * central {@link PLAZA_RADIUS} plaza, or into the {@link generateLake lake}, is
- * dropped, keeping the spawn area clear and no building standing in the water.
+ * streets between them. Footprint + height are additionally graded by district
+ * (M9 · t9b): tall towers cluster in the core, small houses ring the rim. Any
+ * candidate whose footprint would reach inside the central {@link PLAZA_RADIUS}
+ * plaza, or into the {@link generateLake lake}, is dropped, keeping the spawn
+ * area clear and no building standing in the water.
  *
- * Natural/urban features (M9 · t9a) are drawn from a SEPARATE, seed-derived PRNG
- * stream (`seed ^ 0x9e3779b9`) so adding them leaves the per-seed building layout
- * of earlier milestones byte-for-byte unchanged (aside from the deliberate drop
- * of any building that now sits under the lake).
+ * Natural/urban features (M9) are drawn from a SEPARATE, seed-derived PRNG stream
+ * (`seed ^ 0x9e3779b9`) so the lake/forest never perturb the building PRNG: the
+ * per-seed building *placement* stream stays aligned, and only the deliberate t9b
+ * district re-profiling (and the drop of any building now under the lake) changes
+ * the resulting boxes.
  *
  * The four perimeter walls are emitted as thin render `Building` boxes so the
  * client can draw the map edge, but they are intentionally left OUT of
@@ -392,18 +475,34 @@ export function generateWorld(seed: number): World {
       const cellCenterX = -TOWN_HALF + cellSize * (ix + 0.5);
       const cellCenterZ = -TOWN_HALF + cellSize * (iz + 0.5);
 
+      // District gradient (t9b): grade footprint + height by how far the block
+      // sits from the core — tall towers downtown, small houses on the rim. The
+      // factor is 0 at/inside the core edge, 1 at/outside the rim edge.
+      const distAbs =
+        Math.abs(cellCenterX) > Math.abs(cellCenterZ)
+          ? Math.abs(cellCenterX)
+          : Math.abs(cellCenterZ);
+      const districtT = clamp(
+        (distAbs - DISTRICT_CORE_EDGE) / (DISTRICT_RIM_EDGE - DISTRICT_CORE_EDGE),
+        0,
+        1,
+      );
+      const footScale = CORE_FOOT_SCALE + (RIM_FOOT_SCALE - CORE_FOOT_SCALE) * districtT;
+      const minHeight = CORE_MIN_HEIGHT + (RIM_MIN_HEIGHT - CORE_MIN_HEIGHT) * districtT;
+      const maxHeight = CORE_MAX_HEIGHT + (RIM_MAX_HEIGHT - CORE_MAX_HEIGHT) * districtT;
+
       // Draw the footprint & height. We always consume the same number of PRNG
       // values per cell (even when the building is later dropped) so the stream
-      // stays aligned and the whole town stays deterministic.
-      const hw = MIN_HALF_EXTENT + rng() * (MAX_HALF_EXTENT - MIN_HALF_EXTENT);
-      const hd = MIN_HALF_EXTENT + rng() * (MAX_HALF_EXTENT - MIN_HALF_EXTENT);
+      // stays aligned and the whole town stays deterministic. `footScale` (≤ 1)
+      // only shrinks a footprint, so the street-clearance bound still holds.
+      const hw = (MIN_HALF_EXTENT + rng() * (MAX_HALF_EXTENT - MIN_HALF_EXTENT)) * footScale;
+      const hd = (MIN_HALF_EXTENT + rng() * (MAX_HALF_EXTENT - MIN_HALF_EXTENT)) * footScale;
       // Jitter the center, but never enough to breach the cell's inner area.
       const maxOffX = innerHalf - hw;
       const maxOffZ = innerHalf - hd;
       const cx = cellCenterX + (rng() * 2 - 1) * maxOffX;
       const cz = cellCenterZ + (rng() * 2 - 1) * maxOffZ;
-      const height =
-        MIN_BUILDING_HEIGHT + rng() * (MAX_BUILDING_HEIGHT - MIN_BUILDING_HEIGHT);
+      const height = minHeight + rng() * (maxHeight - minHeight);
 
       const candidate: Building = { id: nextId, cx, cz, hw, hd, height };
       const aabb = buildingAABB(candidate);

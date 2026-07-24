@@ -347,10 +347,34 @@ data model + collision so the rest of M9 can build on one source of truth.
   `resolveCircleCircle`, inside the same relaxation loop as buildings and before
   the perimeter clamp — so a player can never walk through a tree or into open
   water.
-- **Baseline generation (refined later in M9).** t9a emits a *sparse* boundary
-  forest (two loose rings just inside the wall, at the map's mid-edges — leaving
-  the square's corners, including the NPC spawn at `half − 5`, clear), one lake
-  placed on a ring that clears the plaza and stays inside the town, and the
-  interior street grid. t9b (districts + ring road), t9c (dense perimeter
-  forest), and t9d (lake placement/rendering) densify these; t9e renders them
-  (instanced); t9f feeds trees/water into the nav grid + AI perception.
+- **Baseline generation (t9a).** t9a emitted a *sparse* boundary forest, one lake
+  on a ring that clears the plaza, and the interior street grid — the seams the
+  rest of M9 builds on.
+
+### World generation — districts, forest, roads, lake (t9b–t9d)
+
+The shared generator now produces a town that reads as a place, still purely from
+the seed and still byte-for-byte identical on client and server:
+
+- **Districts (t9b).** Building footprint + height are graded by a block's
+  Chebyshev distance from the core: a **tower core** (16–44 m) rings the plaza and
+  **small houses** (3.5–8 m, smaller footprints) sit on the outskirts. The
+  per-cell PRNG draw order is unchanged, so the placement stream stays aligned;
+  only the height/footprint mapping changed. `footScale ≤ 1`, so the street-
+  clearance and non-overlap invariants still hold.
+- **Ring road (t9b).** `generateRoads` adds a closed loop at ±`TOWN_HALF` that
+  ties the interior lanes together and fronts the forest (still non-colliding).
+- **Dense perimeter forest (t9c).** `generateTrees` now packs a thick band of
+  solid trees in the square annulus just outside the ring road out to the wall
+  clamp (grid-stepped with per-tree jitter; ~740 trees/seed). At this spacing +
+  trunk radius the band is walk-through-proof — a body marched at any edge/corner
+  is stopped by trees before the wall clamp — so the edge reads as forest, not a
+  slab (the clamp survives as an invisible backstop). The **NPC spawn corner**
+  (`half − 5`) is left an open clearing so patient-zero never wakes wedged in the
+  trees. Verified by `scripts/verify-world.mjs`.
+- **Lake (t9d).** Radius widened to 8–12 m on a 28–38 m ring; still clears the
+  plaza (ring − radius ≥ 16 > 12), stays inside the town, never reaches the forest
+  band, and the road grid routes around it.
+
+t9e renders all of this (instanced) on the client; t9f feeds trees/water into the
+nav grid + AI perception.
