@@ -41,6 +41,11 @@ import { Controls } from './input/Controls';
 import { FollowCamera } from './scene/FollowCamera';
 import { buildTown } from './scene/TownView';
 import { Character } from './entities/Character';
+import {
+  configureRenderer,
+  createAtmosphere,
+  addStreetLights,
+} from './scene/Atmosphere';
 import { HUD } from './ui/HUD';
 import type { InterpolatedEntity } from './net/Interpolation';
 
@@ -53,6 +58,8 @@ const app = document.querySelector<HTMLDivElement>('#app') ?? document.body;
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+// M6 (t6e): enable the moon's soft shadow map (see Atmosphere.ts).
+configureRenderer(renderer);
 app.appendChild(renderer.domElement);
 
 /* -------------------------------------------------------------------------- */
@@ -60,10 +67,10 @@ app.appendChild(renderer.domElement);
 /* -------------------------------------------------------------------------- */
 
 const scene = new THREE.Scene();
-const DARK = new THREE.Color(0x05070a);
-scene.background = DARK;
-// Linear fog so distant geometry dissolves into the crawling dark.
-scene.fog = new THREE.Fog(DARK, MAP_SIZE * 0.12, MAP_SIZE * 0.9);
+// M6 (t6e): the whole mood pass — near-black background + close tense fog, one
+// dim cool ambient, and the single shadow-casting moon — lives in Atmosphere.ts.
+// This replaces the former inline background/fog and the ambient/moon block below.
+createAtmosphere(scene);
 
 /* -------------------------------------------------------------------------- */
 /* Camera — third-person spring-arm follow (starts at a gentle overview)      */
@@ -101,19 +108,6 @@ const grid = new THREE.GridHelper(MAP_SIZE, MAP_SIZE / 4, 0x243244, 0x121a22);
 (grid.material as THREE.Material).opacity = 0.28;
 grid.position.y = 0.01;
 scene.add(grid);
-
-/* -------------------------------------------------------------------------- */
-/* Lighting                                                                   */
-/* -------------------------------------------------------------------------- */
-
-const ambient = new THREE.AmbientLight(0x2a3846, 0.5);
-scene.add(ambient);
-
-const moon = new THREE.DirectionalLight(0xa9c7ff, 1.0);
-moon.position.set(MAP_SIZE * 0.3, MAP_SIZE * 0.6, MAP_SIZE * 0.2);
-moon.target.position.set(0, 0, 0);
-scene.add(moon);
-scene.add(moon.target);
 
 /* -------------------------------------------------------------------------- */
 /* Networking + input                                                         */
@@ -180,6 +174,8 @@ function ensureWorld(): void {
   if (seed === null) return;
   world = generateWorld(seed);
   scene.add(buildTown(world));
+  // M6 (t6e): warm sodium lamp posts along the streets, now that the town exists.
+  addStreetLights(scene, world);
 }
 
 /* -------------------------------------------------------------------------- */
