@@ -1164,6 +1164,15 @@ function animate(): void {
   //     every change internally, so pushing a fresh target each frame is fine.
   audio.setMusicIntensity(roundMusicIntensity(connection.round));
 
+  // 5d. Audio: environment atmosphere (M12 · t12d). Occasional, subtle,
+  //     positional one-shots — distant howls/wind, forest creaks/leaves, and
+  //     water lapping at the lake — chosen from the seeded world features and
+  //     biased to the listener's earshot. Gated on a local body (so the
+  //     listener is anchored) and the town existing (so features are known).
+  if (localFeet !== null && world !== null) {
+    audio.updateEnvironment(dtMs, world);
+  }
+
   // 6. Advance transient combat VFX and the turn feed, culling the expired.
   updateEffects(dtMs);
   updateFeed(dtMs);
