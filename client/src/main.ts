@@ -56,6 +56,7 @@ import {
   createAtmosphere,
   addStreetLights,
 } from './scene/Atmosphere';
+import { createSky } from './scene/Sky';
 import { HUD } from './ui/HUD';
 import { AudioEngine } from './audio/AudioEngine';
 import { AudioControls } from './ui/AudioControls';
@@ -87,6 +88,11 @@ const scene = new THREE.Scene();
 // dim cool ambient, and the single shadow-casting moon — lives in Atmosphere.ts.
 // This replaces the former inline background/fog and the ambient/moon block below.
 createAtmosphere(scene);
+// M11 (t11a/t11b): the night sky — a gradient skydome, a deterministic
+// twinkling starfield, and a moon disc + halo aligned to the moon light —
+// lives in Sky.ts. It opts out of fog and matches the fog color at the
+// horizon, so scene.fog (owned by Atmosphere) is untouched and seam-free.
+createSky(scene);
 
 /* -------------------------------------------------------------------------- */
 /* Camera — third-person spring-arm follow (starts at a gentle overview)      */
