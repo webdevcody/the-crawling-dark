@@ -32,8 +32,13 @@ import { MAP_SIZE, type Building, type World } from '@crawling-dark/shared';
  * The near-black the sky, fog and background all share, so distant geometry
  * fades seamlessly into the void with no visible fog "wall". Matches the value
  * `main.ts` previously set inline as `DARK` (0x05070a).
+ *
+ * M11 (t11e): EXPORTED as the single source of truth for the horizon/fog color.
+ * `Sky.ts` imports it for the skydome's horizon stop so the town dissolving into
+ * fog and the sky's horizon resolve to the exact same pixels — the seam-free
+ * join can never drift out of sync with a second hardcoded copy.
  */
-const DARK = 0x05070a;
+export const DARK = 0x05070a;
 
 /** Cold blue-grey bounce fill. Kept dim so shadows stay deep, but never zero — pitch black is unplayable. */
 const AMBIENT_COLOR = 0x2a3846;
@@ -201,9 +206,19 @@ export function createAtmosphere(scene: THREE.Scene): Atmosphere {
   const dark = new THREE.Color(DARK);
 
   // Background and fog share the same near-black so the far edge of the town
-  // dissolves into the sky with no seam.
+  // dissolves into the sky with no seam. The visible skydome (Sky.ts) paints
+  // over this background; keeping `scene.background = dark` is the fallback for
+  // the one frame before the sky is built and for any pixel the dome misses.
   scene.background = dark;
   // Linear fog: crisp up close, fully black by ~half the map — the "crawling dark".
+  //
+  // M11 (t11e): this fog band is now the SINGLE control over how the town
+  // dissolves. The sky, stars and moon (Sky.ts) all render with `fog: false`,
+  // so they stay fully visible no matter how dense the fog is — the near/far
+  // fractions only govern the town/forest fade, and because the fog color is
+  // the shared DARK == the sky's horizon color, the dissolve lands seamlessly
+  // on the horizon. Left at the M6-tuned band (close + tense) after verifying
+  // stars + moon + lamps all coexist against it.
   scene.fog = new THREE.Fog(dark, MAP_SIZE * FOG_NEAR_FRAC, MAP_SIZE * FOG_FAR_FRAC);
 
   // Dim cool fill so shadowed sides stay just barely legible (never pitch black).

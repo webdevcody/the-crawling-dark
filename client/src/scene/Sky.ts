@@ -33,7 +33,7 @@
 
 import * as THREE from 'three';
 import { MAP_SIZE } from '@crawling-dark/shared';
-import { MOON_LIGHT_POSITION } from './Atmosphere';
+import { MOON_LIGHT_POSITION, DARK } from './Atmosphere';
 
 /* -------------------------------------------------------------------------- */
 /* Tunables                                                                    */
@@ -47,12 +47,11 @@ import { MOON_LIGHT_POSITION } from './Atmosphere';
 const DOME_RADIUS = 900;
 
 /**
- * Horizon (bottom) color of the sky gradient. This MUST equal the fog / DARK
- * color Atmosphere uses (`0x05070a`) so the town fading into fog dissolves into
- * the horizon with no seam. Kept as a private copy (Atmosphere does not export
- * `DARK`); if that value ever changes, update this to match.
+ * Horizon (bottom) color of the sky gradient: the shared {@link DARK} fog color
+ * imported straight from Atmosphere (M11 · t11e), so the town fading into fog
+ * dissolves into the horizon with no seam and the two can never drift apart.
  */
-const SKY_HORIZON_COLOR = 0x05070a;
+const SKY_HORIZON_COLOR = DARK;
 
 /** Zenith (overhead) color — a cold, deep midnight blue the gradient climbs to. */
 const SKY_ZENITH_COLOR = 0x0a1a3a;
