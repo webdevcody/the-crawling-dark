@@ -1,0 +1,21 @@
+{
+  "name": "@crawling-dark/client",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "three": "^0.171.0",
+    "@crawling-dark/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0",
+    "typescript": "^5.7.2",
+    "@types/three": "^0.171.0"
+  }
+}
