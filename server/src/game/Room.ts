@@ -334,13 +334,26 @@ export class Room {
    *    loop counts the window down ({@link tickGrace}); a reconnect within it
    *    reclaims the identity, otherwise it is finally {@link remove}d.
    *
-   * Idempotent and migration-safe: it no-ops if `player` is no longer the live
-   * record for its id (e.g. it was already reclaimed onto a new socket, or
-   * already removed), so a late close event on a superseded socket does nothing.
+   * Idempotent and migration-safe. It no-ops when `player` is no longer the live
+   * record for its id (already removed), and — via `closingSocket` — when the
+   * socket that closed is no longer this player's live pipe. The thin `ws` bridge
+   * passes the exact socket whose close/error fired; a reconnect rebinds a fresh
+   * socket onto the SAME {@link Player} object (M7 · t7d), and `ws` emits `close`
+   * AFTER `error`, so the old socket's trailing events would otherwise re-enter
+   * here and null the brand-new reconnected socket, silently killing the just-
+   * restored session. The socket-identity guard below is what prevents that.
+   * (Callers that omit `closingSocket` disconnect the current socket, preserving
+   * the pre-t7d single-argument behavior.)
    */
-  disconnect(player: Player): void {
+  disconnect(player: Player, closingSocket: WebSocket | null = player.socket): void {
     // Stale/superseded reference (already reclaimed or removed): ignore.
     if (this.players.get(player.id) !== player) return;
+
+    // Stale socket: this close/error came from a socket that is no longer the
+    // player's live pipe — a reconnect already rebound a fresh one, or this drop
+    // was already processed and the socket nulled. Ignore it so a trailing close
+    // on the OLD socket can't null the reconnected socket (see the doc above).
+    if (closingSocket !== player.socket) return;
 
     // Spectators and the NPC have no identity worth holding open — drop now.
     if (player.spectator || player.isNpc) {
