@@ -36,6 +36,8 @@
 import * as THREE from 'three';
 import {
   MAP_SIZE,
+  TICK_MS,
+  CLIENT_FPS,
   generateWorld,
   type World,
   type EntityKind,
@@ -261,7 +263,9 @@ function syncEntities(
   nowMs: number,
 ): { x: number; y: number; z: number } | null {
   const localId = connection.playerId;
-  let localFeet: { x: number; y: number; z: number } | null = null;
+  // Reuse a module scratch for the returned feet position (M8 · t8e) rather than
+  // allocating a fresh `{x,y,z}` every frame; the caller consumes it immediately.
+  let haveLocal = false;
 
   // Frame delta for the rigs, clamped so a stalled tab can't fling the pose.
   const dtMs = lastCharNowMs === 0 ? 0 : Math.min(100, Math.max(0, nowMs - lastCharNowMs));
@@ -288,7 +292,12 @@ function syncEntities(
     character.root.position.set(entity.x, entity.y, entity.z);
     character.update(entity.state, entity.yaw, nowMs, dtMs);
 
-    if (isLocal) localFeet = { x: entity.x, y: entity.y, z: entity.z };
+    if (isLocal) {
+      localFeetScratch.x = entity.x;
+      localFeetScratch.y = entity.y;
+      localFeetScratch.z = entity.z;
+      haveLocal = true;
+    }
   }
 
   // Remove departed entities, disposing each rig's owned material. The shared
@@ -301,8 +310,16 @@ function syncEntities(
     }
   }
 
-  return localFeet;
+  return haveLocal ? localFeetScratch : null;
 }
+
+/**
+ * Reused feet-position scratch returned by {@link syncEntities} (M8 · t8e). Its
+ * fields are overwritten each frame the local body is present and the value is
+ * consumed immediately by the audio listener + follow camera, so a single shared
+ * object is safe and keeps the sample→sync→override hot path allocation-free.
+ */
+const localFeetScratch = { x: 0, y: 0, z: 0 };
 
 /* -------------------------------------------------------------------------- */
 /* Combat VFX — short-lived meshes spawned from server events                  */
@@ -518,6 +535,124 @@ function localStamina(entities: Map<number, InterpolatedEntity>): number | null 
 }
 
 /* -------------------------------------------------------------------------- */
+/* Perf overlay — toggleable frame-budget readout (M8 · t8e)                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Target per-frame budget in milliseconds. A *stable* frame time at
+ * {@link CLIENT_FPS} — not a high peak fps — is what makes walking read as smooth,
+ * so this is the number the overlay's p95 is checked against. At 60 fps ≈ 16.7 ms.
+ */
+const FRAME_BUDGET_MS = 1000 / CLIENT_FPS;
+
+/**
+ * How often (ms) the perf overlay recomputes its stats and repaints while visible.
+ * The per-frame cost is just one ring-buffer write; the copy+sort for p95 and the
+ * DOM paint happen only this often, so the overlay itself never distorts the
+ * frame budget it is measuring.
+ */
+const PERF_REFRESH_MS = 250;
+
+/**
+ * A toggleable performance overlay (M8 · t8e): live FPS, mean + p95 frame time
+ * (vs. {@link FRAME_BUDGET_MS}), and draw-call / triangle counts pulled from
+ * `renderer.info` after each render. Hidden by default; the backtick key (`)
+ * toggles it. It keeps a small ring of recent frame times so the p95 reflects the
+ * GC hitches a mean would hide — a flat p95 near the budget is the t8e goal.
+ */
+class PerfOverlay {
+  private readonly el: HTMLDivElement;
+  private readonly frames: number[];
+  private head = 0;
+  private count = 0;
+  private sinceRefreshMs = 0;
+  private visible = false;
+
+  constructor(parent: HTMLElement, private readonly capacity = 120) {
+    this.frames = new Array<number>(capacity).fill(0);
+    this.el = document.createElement('div');
+    Object.assign(this.el.style, {
+      position: 'fixed',
+      top: '12px',
+      right: '12px',
+      padding: '8px 12px',
+      font: '11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace',
+      color: '#bfe6c9',
+      background: 'rgba(5, 7, 10, 0.72)',
+      border: '1px solid rgba(58, 106, 74, 0.5)',
+      borderRadius: '6px',
+      pointerEvents: 'none',
+      userSelect: 'none',
+      whiteSpace: 'pre',
+      backdropFilter: 'blur(2px)',
+      zIndex: '20',
+    } satisfies Partial<CSSStyleDeclaration>);
+    this.el.style.display = 'none';
+    parent.appendChild(this.el);
+  }
+
+  /** Show/hide the overlay (bound to the backtick key in the input wiring). */
+  toggle(): void {
+    this.visible = !this.visible;
+    this.el.style.display = this.visible ? 'block' : 'none';
+  }
+
+  /**
+   * Record this frame's time and, while visible, refresh the readout (throttled to
+   * {@link PERF_REFRESH_MS}) from `renderer.info`. Recording is two cheap writes;
+   * the sort + DOM paint run only on the throttled refresh, and nothing runs at
+   * all while hidden beyond the ring write.
+   */
+  update(dtMs: number, info: THREE.WebGLInfo): void {
+    this.frames[this.head] = dtMs;
+    this.head = (this.head + 1) % this.capacity;
+    if (this.count < this.capacity) this.count += 1;
+
+    if (!this.visible) return;
+    this.sinceRefreshMs += dtMs;
+    if (this.sinceRefreshMs < PERF_REFRESH_MS) return;
+    this.sinceRefreshMs = 0;
+
+    let sum = 0;
+    for (let i = 0; i < this.count; i += 1) sum += this.frames[i];
+    const mean = this.count > 0 ? sum / this.count : 0;
+    const fps = mean > 0 ? 1000 / mean : 0;
+
+    // p95 over the window — the copy + sort only run at the throttled cadence.
+    const sorted = this.frames.slice(0, this.count).sort((a, b) => a - b);
+    const p95 =
+      sorted.length > 0
+        ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))]
+        : 0;
+    const over = p95 > FRAME_BUDGET_MS;
+
+    this.el.innerHTML =
+      `<div>fps ${fps.toFixed(0)}  ·  frame ${mean.toFixed(1)}ms</div>` +
+      `<div style="color:${over ? '#ff8f6b' : '#bfe6c9'}">` +
+      `p95 ${p95.toFixed(1)}ms / ${FRAME_BUDGET_MS.toFixed(1)}ms budget</div>` +
+      `<div>draws ${info.render.calls}  ·  tris ${info.render.triangles.toLocaleString()}</div>`;
+  }
+
+  /** Detach the overlay element (page teardown). */
+  dispose(): void {
+    this.el.remove();
+  }
+}
+
+/** The perf overlay, hidden until the backtick key toggles it (see input wiring). */
+const perf = new PerfOverlay(app);
+
+/**
+ * Backtick (`) toggles the perf overlay (M8 · t8e). Bound on `window` so it works
+ * with or without pointer lock, and `repeat` is ignored so a held key doesn't
+ * strobe it — mirroring the `R` ready toggle above.
+ */
+window.addEventListener('keydown', (ev) => {
+  if (ev.code !== 'Backquote' || ev.repeat) return;
+  perf.toggle();
+});
+
+/* -------------------------------------------------------------------------- */
 /* Resize handling                                                            */
 /* -------------------------------------------------------------------------- */
 
@@ -581,6 +716,45 @@ function driveFootsteps(
 }
 
 /* -------------------------------------------------------------------------- */
+/* Fixed-timestep input pump (M8 · t8a + t8c)                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Fixed input/prediction sub-step in seconds — the EXACT tick the server
+ * integrates (`DT = TICK_MS / 1000` in `Room.ts`). Every INPUT frame is sent, and
+ * every predictor {@link Predictor.record}, uses this `dt` rather than the variable
+ * render delta, so the client sim advances byte-for-byte with the authority and no
+ * longer drifts between reconciles (t8a).
+ */
+const INPUT_DT_SEC = TICK_MS / 1000;
+
+/**
+ * Maximum fixed input sub-steps pumped per render frame — mirrors the server's
+ * `MAX_CATCHUP_STEPS`. Caps catch-up so a stalled/backgrounded tab that wakes with
+ * a huge render delta can't spiral out a burst of inputs; the backlog beyond the
+ * cap is dropped (see {@link inputAccumulatorMs}).
+ */
+const MAX_INPUT_SUBSTEPS = 5;
+
+/**
+ * Leftover render time (ms) not yet consumed by a fixed sub-step, carried across
+ * frames so no motion is dropped or double-counted — the server's accumulator,
+ * client-side. Each frame adds the render delta; the pump drains it one
+ * {@link TICK_MS} at a time and the sub-tick remainder (`< TICK_MS`) rolls forward.
+ */
+let inputAccumulatorMs = 0;
+
+/**
+ * Held-key bitmask OR-accumulated across EVERY render frame since the last INPUT
+ * send (t8c). Because INPUT now emits once per fixed sub-step (~TICK_RATE) rather
+ * than once per render frame, a key TAP that goes down and back up entirely
+ * between two sends would otherwise be lost; OR-ing each render frame's
+ * {@link Controls.keys} in here guarantees the press is seen. It is consumed at
+ * each send and reset to the currently-held keys so held keys persist.
+ */
+let accumulatedKeys = 0;
+
+/* -------------------------------------------------------------------------- */
 /* Render loop                                                                */
 /* -------------------------------------------------------------------------- */
 
@@ -591,17 +765,36 @@ function animate(): void {
   const dtMs = dt * 1000;
   const now = performance.now();
 
-  // 1. Push this frame's input (held-key bitmask + look yaw) to the server,
-  //    capturing the seq so the local predictor can key its input history by it.
-  const seq = connection.sendInput(controls.keys, dt, controls.yaw);
-
-  // 2. Build the town once we know the seed.
+  // 1. Build the town once we know the seed (the fixed pump below records into
+  //    the predictor, which needs the town for the same XZ collision as the server).
   ensureWorld();
 
-  // 2b. Mirror this frame's input into the local predictor so our own body moves
-  //     instantly (needs the town for the same XZ collision the server applies).
-  if (world !== null) {
-    predictor.record(seq, controls.keys, controls.yaw, dt, world);
+  // 1b. Fixed-timestep INPUT + prediction pump (t8a/t8c). Accumulate this frame's
+  //     render time and advance in fixed TICK_MS sub-steps, mirroring the server's
+  //     accumulator. Each sub-step sends ONE input (allocating its seq) and records
+  //     that SAME seq into the predictor with the fixed dt, so INPUT rate tracks the
+  //     tick rate (not the frame rate) and the server ack/predictor replay align.
+  //     A key TAP between two sends is preserved via the OR-accumulated mask.
+  accumulatedKeys |= controls.keys; // fold this render frame's held/tapped keys
+  inputAccumulatorMs += dtMs;
+  let inputSteps = 0;
+  while (inputAccumulatorMs >= TICK_MS && inputSteps < MAX_INPUT_SUBSTEPS) {
+    const keys = accumulatedKeys; // consume presses seen since the last send
+    const yaw = controls.yaw; // latest look yaw at send time
+    const seq = connection.sendInput(keys, INPUT_DT_SEC, yaw);
+    // Mirror the same input into the predictor (guarded by the town, as before);
+    // still send even before the world exists so seq stays continuous.
+    if (world !== null) {
+      predictor.record(seq, keys, yaw, INPUT_DT_SEC, world);
+    }
+    accumulatedKeys = controls.keys; // reset to still-held keys (held ones persist)
+    inputAccumulatorMs -= TICK_MS;
+    inputSteps += 1;
+  }
+  // Hit the cap with time still owed: drop the backlog rather than chase it,
+  // exactly like the server's pump, so a long stall can't spiral.
+  if (inputSteps === MAX_INPUT_SUBSTEPS && inputAccumulatorMs > TICK_MS) {
+    inputAccumulatorMs = 0;
   }
 
   // 3. Sample the interpolated world once; reused for events, meshes, and HUD.
@@ -621,9 +814,16 @@ function animate(): void {
     }
   }
 
+  // 3b-smooth. Advance the reconciliation error-smoothing offset by this render
+  //     frame (t8b). Done once per RENDER frame — the fixed prediction sub-steps in
+  //     step 1b no longer run every frame — and BEFORE reading `predictor.predicted`
+  //     below, so the smoothed offset is current for this frame's draw.
+  predictor.decayOffset(dtMs);
+
   // 3c. Render override (upstream of syncEntities so that module stays decoupled):
-  //     replace ONLY the local entity's transform with the predicted values,
-  //     leaving its kind/state — and every remote entity — interpolated as before.
+  //     replace ONLY the local entity's transform with the predicted values (which
+  //     already include the smoothing offset), leaving its kind/state — and every
+  //     remote entity — interpolated as before.
   if (predictor.hasBase && connection.playerId !== null) {
     const me = entities.get(connection.playerId);
     if (me !== undefined) {
@@ -718,6 +918,11 @@ function animate(): void {
   });
 
   renderer.render(scene, camera);
+
+  // 9. Sample the perf overlay AFTER the draw so `renderer.info` reflects this
+  //    frame's draw calls / triangles (M8 · t8e). Records the frame time every
+  //    frame; only repaints (throttled) while the overlay is toggled on.
+  perf.update(dtMs, renderer.info);
 }
 
 renderer.setAnimationLoop(animate);
@@ -729,4 +934,5 @@ window.addEventListener('beforeunload', () => {
   hud.dispose();
   audioControls.dispose();
   audio.dispose();
+  perf.dispose();
 });

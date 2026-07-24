@@ -263,3 +263,59 @@ without duplication. Values match the "locked" numbers above.
 |---|---|---|
 | `MAP_SIZE` | Square town size in world units (spans ±MAP_SIZE/2 on X/Z) | `128` |
 | `DEFAULT_SERVER_PORT` | Default authoritative WebSocket server port | `8080` |
+
+---
+
+## M8 tuning notes (Phase 2 — Movement Feel & Performance)
+
+Milestone **M8** attacks walk-around jitter and frame-time stability. The perceived
+smoothness comes almost entirely from the **client** side; the wire rates below were
+re-evaluated and deliberately left unchanged.
+
+### Client prediction & interpolation (t8a–t8d)
+
+- **Fixed-timestep prediction (t8a).** The local player now predicts in fixed
+  `TICK_MS` sub-steps driven by an accumulator that mirrors the server's loop, so
+  client and server integrate the *same* `dt` and no longer drift between
+  reconciles. INPUT is pumped from that same accumulator, which also **decouples the
+  input send-rate from the frame-rate (t8c)** — ~`TICK_RATE` sends/s at 30, 60, or
+  144 fps.
+- **Reconciliation error-smoothing (t8b).** A correction is folded into a decaying
+  render offset (half-life ≈ 45 ms, ~5–8 frames) instead of snapping the body;
+  corrections past `SNAP_DIST` (1.75 m — a real teleport/respawn) still snap.
+- **Adaptive interpolation + extrapolation (t8d).** The remote-entity interpolation
+  delay adapts to measured inter-arrival jitter within a band seeded on
+  `INTERP_BUFFER_MS` (`INTERP_DELAY_MIN_MS` … `INTERP_DELAY_MAX_MS`), and a late
+  snapshot is briefly extrapolated (≤ `INTERP_EXTRAPOLATION_CAP_MS`) rather than
+  frozen, killing the old freeze-then-jump stutter.
+
+### Frame budget (t8e)
+
+- **Target: one render frame ≤ `1000 / CLIENT_FPS` ≈ 16.7 ms (60 fps)**, held with a
+  full `MAX_PLAYERS` (12) + NPC room. A *stable* frame time — a flat p95 near the
+  budget — is what makes walking read as smooth, more than a high peak fps.
+- A toggleable perf overlay (backtick `` ` `` key) reports FPS, mean + **p95 frame
+  time** vs. that budget, and draw calls / triangles from `renderer.info`.
+- The `sample → sync → override` hot path was made allocation-free in steady state:
+  the interpolator reuses its output map + a per-id entity pool + a scratch index
+  map, and `syncEntities` reuses a feet-position scratch — so GC hitches don't show
+  up as periodic micro-stutter in the p95 graph.
+
+### Snapshot broadcast rate (t8f) — **recommendation: keep `SNAPSHOT_RATE = 15`**
+
+The broadcast cadence is `tick % SNAPSHOT_TICK_INTERVAL === 0` with
+`SNAPSHOT_TICK_INTERVAL = TICK_RATE / SNAPSHOT_RATE`, which **must be an integer**.
+With the fixed 30 Hz `TICK_RATE`, the only attainable rates are the integer divisors
+of 30 — so the plan's "~15–20 Hz" really means **15 (every 2nd tick) or 30 (every
+tick)**; 20 Hz would give a non-integral interval of 1.5 and is not reachable
+without moving the sim tick.
+
+Going to 30 Hz roughly **doubles snapshot bandwidth**. With the client fixes above
+(t8a/t8b prediction for your own body, t8d adaptive interp + extrapolation for
+everyone else) already covering the ~`SNAPSHOT_MS` (≈ 66.7 ms) gap, and M7's binary +
+delta snapshots keeping a typical frame to ~57 B, that extra bandwidth buys only a
+marginal, hard-to-perceive smoothness gain. **15 Hz stays the shipping value** and
+comfortably holds the M7 bandwidth targets; **30 Hz is the one integral step up** if
+a future change ever needs it. Because `INTERP_DELAY_MIN_MS` is expressed relative to
+`SNAPSHOT_MS`, the t8d interpolation band keeps straddling snapshots automatically at
+either rate.

@@ -567,9 +567,13 @@ export class Connection {
   /* ---- Outbound frames -------------------------------------------------- */
 
   /**
-   * Send one sampled input frame. Called once per render frame with the live
-   * held-key bitmask and look yaw; `seq` auto-increments so the server can ack it.
-   * Sending is a no-op while the socket is down, but the `seq` is still allocated
+   * Send one sampled input frame. As of M8 (t8a/t8c) the caller pumps this on a
+   * FIXED timestep — once per simulation sub-step (~{@link TICK_RATE} Hz), NOT once
+   * per render frame — so the INPUT rate is decoupled from the frame rate (a 144 Hz
+   * client no longer floods and a 30 Hz client isn't starved) and `dt` is the fixed
+   * tick delta rather than a variable render delta. This method's own behavior is
+   * unchanged by that: `seq` auto-increments per call so the server can ack it, and
+   * sending is a no-op while the socket is down, but the `seq` is still allocated
    * and returned so the caller's local prediction history stays continuous.
    *
    * Returns the `seq` assigned to this frame so the client-side predictor (M6) can
@@ -577,7 +581,7 @@ export class Connection {
    * callers may ignore the return value — this is a backward-compatible change.
    *
    * @param keys Held-key bitmask (see `InputKey` in the shared protocol).
-   * @param dt   Frame delta in seconds (advisory; the server is authoritative).
+   * @param dt   Fixed sub-step delta in seconds (advisory; the server is authoritative).
    * @param yaw  Aim/look yaw in radians.
    * @returns The monotonic input `seq` sent for this frame.
    */
