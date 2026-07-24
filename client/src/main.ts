@@ -64,6 +64,10 @@ import { HUD } from './ui/HUD';
 import { AudioEngine, type Point3, type FootstepSurface } from './audio/AudioEngine';
 import { AudioControls } from './ui/AudioControls';
 import type { InterpolatedEntity } from './net/Interpolation';
+import { PostFx } from './scene/PostFx';
+import { Particles } from './scene/Particles';
+import { CameraShake } from './scene/CameraShake';
+import { ScreenFx } from './ui/ScreenFx';
 
 const app = document.querySelector<HTMLDivElement>('#app') ?? document.body;
 
@@ -88,6 +92,11 @@ renderer.toneMappingExposure = 1.2;
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 // M6 (t6e): enable the moon's soft shadow map (see Atmosphere.ts).
 configureRenderer(renderer);
+// M14: the post-processing composer renders the scene + several full-screen
+// passes per frame, each of which would auto-reset renderer.info — leaving the
+// perf overlay (t8e) reading only the LAST pass. Take ownership of the reset
+// (once per frame, just before the draw) so draws/tris report the true total.
+renderer.info.autoReset = false;
 // M10 (t10a): capture the GPU's max anisotropy so every tiled PBR texture the
 // TextureLibrary hands out stays crisp at grazing angles. Must run before any
 // world/material is built (the town is built later, on WELCOME).
@@ -124,6 +133,29 @@ camera.position.set(0, 14, 20);
 camera.lookAt(0, 1, 0);
 
 const follow = new FollowCamera(camera);
+
+/* -------------------------------------------------------------------------- */
+/* M14 — VFX & post-processing (bloom + horror grade, particles, camera juice, */
+/* screen-space feedback). Pure client-side game-feel over the M8-M13 base.    */
+/* -------------------------------------------------------------------------- */
+
+// Post-processing: RenderPass -> bloom -> horror vignette/grain -> OutputPass.
+// The composer performs the final ACES + sRGB (M11), so the renderer's
+// tone-mapping stays untouched. `P` toggles it (postFx.enabled) for an A/B.
+const postFx = new PostFx(renderer, scene, camera);
+
+// Trauma-based camera shake + FOV kick + landing punch, applied as a
+// non-accumulating offset AFTER follow.update each frame (which fully rewrites
+// the camera transform, so the offset never drifts).
+const cameraShake = new CameraShake(camera);
+
+// Pooled GPU particle system (one Points draw): bat-impact sparks, infection
+// spores, footstep/landing dust - driven off the server event stream below.
+const particles = new Particles(scene);
+
+// Local-player screen-space feedback: an infection flash on turning, plus a
+// proximity 'danger' vignette that rises as the nearest zombie closes in.
+const screenFx = new ScreenFx(app);
 
 /* -------------------------------------------------------------------------- */
 /* Ground plane + grid                                                        */
@@ -764,6 +796,17 @@ window.addEventListener('keydown', (ev) => {
   perf.toggle();
 });
 
+/**
+ * `P` toggles the M14 post-processing chain (bloom + horror grade) on/off, so
+ * its cost/look can be A/B'd against the raw render. Mirrors the perf overlay's
+ * backtick binding: window-level so it works with or without pointer lock, and
+ * `repeat` is ignored so a held key doesn't strobe it.
+ */
+window.addEventListener('keydown', (ev) => {
+  if (ev.code !== 'KeyP' || ev.repeat) return;
+  postFx.enabled = !postFx.enabled;
+});
+
 /* -------------------------------------------------------------------------- */
 /* Resize handling                                                            */
 /* -------------------------------------------------------------------------- */
@@ -772,6 +815,8 @@ function onResize(): void {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+  // M14: resize the post-processing composer + its render targets to match.
+  postFx.setSize(window.innerWidth, window.innerHeight);
 }
 window.addEventListener('resize', onResize);
 
@@ -865,7 +910,11 @@ function driveFootsteps(
     // skips a spurious whoosh for an entity first sighted already mid-jump.
     const prev = prevEntityState.get(entity.id);
     if (prev !== undefined && prev !== 'jump' && s === 'jump') audio.jump(entity);
-    else if (prev === 'jump' && s !== 'jump') audio.land(entity);
+    else if (prev === 'jump' && s !== 'jump') {
+      audio.land(entity);
+      // M14: a camera landing punch when the LOCAL player touches down.
+      if (entity.id === connection.playerId) cameraShake.landingPunch();
+    }
     prevEntityState.set(entity.id, s);
 
     if (s !== 'walk' && s !== 'run' && s !== 'crawl') {
@@ -1008,6 +1057,62 @@ function clamp01(x: number): number {
   return x < 0 ? 0 : x > 1 ? 1 : x;
 }
 
+/* -------------------------------------------------------------------------- */
+/* M14 — game-feel helpers (proximity-scaled camera trauma + danger vignette)  */
+/* -------------------------------------------------------------------------- */
+
+/** Full camera trauma for a point-blank event; fades to 0 by this range (m). */
+const PROXIMITY_TRAUMA_FALLOFF_M = 14;
+/** Cap on the trauma a nearby (non-local) event may add. */
+const PROXIMITY_TRAUMA_MAX = 0.35;
+/** Nearest-zombie distance (m) at/under which the danger vignette is full. */
+const DANGER_NEAR_M = 3;
+/** Nearest-zombie distance (m) at/beyond which the danger vignette is off. */
+const DANGER_FAR_M = 12;
+
+/**
+ * A small camera-shake amount (0..{@link PROXIMITY_TRAUMA_MAX}) for an event at
+ * world (x, z), scaled by how close it happened to the local player - so a
+ * distant scuffle barely registers while a fight in your face rattles the lens.
+ * Zero if we have no body yet.
+ */
+function traumaByProximity(
+  x: number,
+  z: number,
+  entities: Map<number, InterpolatedEntity>,
+): number {
+  const localId = connection.playerId;
+  const me = localId !== null ? entities.get(localId) : undefined;
+  if (me === undefined) return 0;
+  const dx = x - me.x;
+  const dz = z - me.z;
+  const d = Math.sqrt(dx * dx + dz * dz);
+  return PROXIMITY_TRAUMA_MAX * clamp01((PROXIMITY_TRAUMA_FALLOFF_M - d) / PROXIMITY_TRAUMA_FALLOFF_M);
+}
+
+/**
+ * Rising 0..1 'danger' intensity as the nearest zombie closes on a HUMAN local
+ * player, mapped from {@link DANGER_FAR_M} (0) to {@link DANGER_NEAR_M} (1).
+ * Zero when we're the zombie (turned), have no body, or the map is zombie-free.
+ */
+function dangerIntensity(
+  entities: Map<number, InterpolatedEntity>,
+  localFeet: { x: number; y: number; z: number } | null,
+): number {
+  if (localFeet === null || localTeam(entities) !== 'human') return 0;
+  let nearestSq = Infinity;
+  for (const e of entities.values()) {
+    if (e.kind !== 'zombie') continue;
+    const dx = e.x - localFeet.x;
+    const dz = e.z - localFeet.z;
+    const d2 = dx * dx + dz * dz;
+    if (d2 < nearestSq) nearestSq = d2;
+  }
+  if (nearestSq === Infinity) return 0;
+  const d = Math.sqrt(nearestSq);
+  return clamp01((DANGER_FAR_M - d) / (DANGER_FAR_M - DANGER_NEAR_M));
+}
+
 /**
  * Map the current {@link RoundMessage} to a musical intensity in [0, 1] for the
  * {@link AudioEngine.setMusicIntensity dynamic music bed}:
@@ -1134,6 +1239,8 @@ function animate(): void {
         const y = ev.y ?? src?.y ?? 0;
         const z = ev.z ?? src?.z ?? 0;
         spawnSwingVfx(x, y, z, src?.yaw ?? 0);
+        // M14: a small FOV kick when it's YOUR swing, for weight.
+        if (ev.actorId === connection.playerId) cameraShake.kickFov(3);
         // A zombie's attack is a claw swipe; a human's is the bat whoosh (t12b).
         if (src?.kind === 'zombie') audio.zombieClaw({ x, y, z });
         else audio.swing({ x, y, z });
@@ -1145,6 +1252,17 @@ function animate(): void {
         const y = ev.y ?? tgt?.y ?? 0;
         const z = ev.z ?? tgt?.z ?? 0;
         spawnStunVfx(x, y, z);
+        // M14: bat-impact sparks at the victim + a camera punch. A hit YOU
+        // landed (or took) rattles hardest; otherwise it falls off with range.
+        particles.sparks(x, y, z);
+        if (ev.actorId === connection.playerId) {
+          cameraShake.addTrauma(0.5);
+          cameraShake.kickFov(4);
+        } else if (ev.targetId === connection.playerId) {
+          cameraShake.addTrauma(0.6);
+        } else {
+          cameraShake.addTrauma(traumaByProximity(x, z, entities));
+        }
         audio.hit({ x, y, z }); // bat-hit impact at the victim
         pushFeedLine(`#${ev.actorId ?? '?'} stunned #${ev.targetId ?? '?'} 🦇`);
         break;
@@ -1155,6 +1273,15 @@ function animate(): void {
         const y = ev.y ?? tgt?.y ?? 0;
         const z = ev.z ?? tgt?.z ?? 0;
         spawnInfectVfx(x, y, z);
+        // M14: a spore burst at the victim; if it was YOU, a hard shake + the
+        // full-screen infection flash - otherwise a proximity-scaled jolt.
+        particles.spores(x, y, z);
+        if (ev.targetId === connection.playerId) {
+          screenFx.infected();
+          cameraShake.addTrauma(0.8);
+        } else {
+          cameraShake.addTrauma(traumaByProximity(x, z, entities));
+        }
         audio.infect({ x, y, z }); // infection stinger at the victim
         audio.duck(); // dip music/ambient so the stinger reads (t12e)
         pushFeedLine(`Player #${ev.targetId ?? '?'} was turned 🧟`);
@@ -1163,6 +1290,7 @@ function animate(): void {
       case 'roundStart': {
         // A rising horn to open the match. Non-positional: centred on the player.
         audio.roundStart(listenerAnchor(entities));
+        cameraShake.addTrauma(0.25); // M14: a light jolt on the opening horn.
         audio.duck(); // dip the beds so the opening horn reads (t12e)
         break;
       }
@@ -1170,6 +1298,7 @@ function animate(): void {
         // A closing sting, varied by who won (bright human triad vs dark zombie
         // cluster). Winner rides on the ROUND message, not the event itself.
         audio.roundEnd(listenerAnchor(entities), connection.round?.winner);
+        cameraShake.addTrauma(0.3); // M14: a heavier jolt on the closing sting.
         audio.duck(0.28); // deeper dip so the closing sting lands (t12e)
         break;
       }
@@ -1212,9 +1341,20 @@ function animate(): void {
   // 6b. Ripple the lake surface (M9 · t9d) — a cheap UV scroll, no allocations.
   water?.update(dtMs);
 
+  // 6c. M14: advance the pooled particle system + the screen-space feedback
+  //     overlay. The danger vignette rises as the nearest zombie closes on a
+  //     HUMAN local player (0 when we're a zombie or have no body yet).
+  particles.update(dtMs);
+  screenFx.danger(dangerIntensity(entities, localFeet));
+  screenFx.update(dtMs);
+
   // 7. Drive the third-person camera when we have a local body and the town.
   if (localFeet !== null && world !== null) {
     follow.update(localFeet, controls.yaw, world, dt);
+    // M14: layer camera juice (shake + FOV kick + landing dip) as a
+    // non-accumulating offset - follow.update fully rewrote the transform
+    // above, so next frame wipes it clean.
+    cameraShake.apply(dtMs);
   }
 
   // 8. Refresh the round HUD from the latest ROUND + connection/local state.
@@ -1240,7 +1380,13 @@ function animate(): void {
       : 'click canvas to look',
   });
 
-  renderer.render(scene, camera);
+  // M14: reset renderer.info once here (autoReset is off, see setup) so it
+  // accumulates across every post-processing pass for a true per-frame total.
+  renderer.info.reset();
+  // M14: render through the post-processing chain (bloom + horror grade)
+  // instead of a bare renderer.render; OutputPass applies the M11 ACES + sRGB
+  // at the end. `P` toggles it off (postFx.enabled=false) for the raw render.
+  postFx.render(dtMs);
 
   // 9. Sample the perf overlay AFTER the draw so `renderer.info` reflects this
   //    frame's draw calls / triangles (M8 · t8e). Records the frame time every
@@ -1261,4 +1407,9 @@ window.addEventListener('beforeunload', () => {
   // M9 (t9d/t9e): free the environment + lake surface GPU resources.
   if (environment !== null) disposeEnvironment(environment);
   water?.dispose();
+  // M14: free the VFX / post-processing resources.
+  postFx.dispose();
+  particles.dispose();
+  cameraShake.dispose();
+  screenFx.dispose();
 });
