@@ -1,5 +1,5 @@
 /**
- * The Crawling Dark — client entry point (M2 · Movement & World demo).
+ * The Crawling Dark — client entry point (M3 · Combat & Infection demo).
  *
  * Wires the M2 systems into a playable third-person scene:
  *   - the seeded town ({@link buildTown}) rendered from the same {@link World}
@@ -10,6 +10,12 @@
  *     the local player and retracts around walls;
  *   - remote (and local) entities rendered from interpolated snapshots
  *     (~INTERP_BUFFER_MS in the past) so everyone moves smoothly.
+ *
+ * M3 (t3d) layers combat on top: left-click sends an ATTACK; bodies are colored
+ * by team (human vs zombie) and repaint the instant an infection flips a body's
+ * `kind`; entity `state` drives the swing / stun / downed tells; and the
+ * server's attack/stun/infect events (drained from {@link Connection.drainEvents})
+ * spawn short-lived VFX and feed a bottom-left kill/turn ticker.
  *
  * There is no client-side prediction yet — the local player is also drawn from
  * interpolated server state, so it lags input slightly. Prediction/reconciliation
@@ -24,11 +30,13 @@ import {
   CRAWL_HEIGHT,
   generateWorld,
   type World,
+  type EntityKind,
 } from '@crawling-dark/shared';
 import { Connection } from './net/Connection';
 import { Controls } from './input/Controls';
 import { FollowCamera } from './scene/FollowCamera';
 import { buildTown } from './scene/TownView';
+import type { InterpolatedEntity } from './net/Interpolation';
 
 const app = document.querySelector<HTMLDivElement>('#app') ?? document.body;
 
@@ -110,6 +118,20 @@ const controls = new Controls();
 controls.attachPointerLock(renderer.domElement);
 connection.connect();
 
+/**
+ * Left-click to swing the bat. Pointer lock is requested by Controls on the
+ * FIRST canvas click, and at that mousedown the pointer is not yet locked — so
+ * that click only enters play and never swings. Every subsequent left-click
+ * fires only while `pointerLocked` (i.e. actually playing), cleanly separating
+ * click-to-play from click-to-swing without fighting the lock wiring. Right and
+ * middle buttons are ignored.
+ */
+renderer.domElement.addEventListener('mousedown', (ev) => {
+  if (ev.button !== 0) return;
+  if (!controls.pointerLocked) return;
+  connection.sendAttack();
+});
+
 /* -------------------------------------------------------------------------- */
 /* Town — built once WELCOME's mapSeed arrives (identical to the server's)     */
 /* -------------------------------------------------------------------------- */
@@ -137,8 +159,21 @@ const PLAYER_GEOMETRY = new THREE.BoxGeometry(
   PLAYER_RADIUS * 2,
 );
 
-/** Highlight color for the local player so you can tell which body is you. */
+/** Highlight color for the local player (human) so you can tell which body is you. */
 const LOCAL_COLOR = new THREE.Color(0x53ffa8);
+
+/**
+ * The LOCAL player's zombie tint — a toxic, self-lit green. Combined with the
+ * strong emissive glow every local body carries, it keeps "you" unmistakable
+ * even after turning, while still visibly reading as the zombie team.
+ */
+const LOCAL_ZOMBIE_COLOR = new THREE.Color(0x9dff2f);
+
+/** Electric-yellow tint layered onto a body's emissive while it is stunned. */
+const STUN_TINT = new THREE.Color(0xffe14a);
+
+/** How far a downed body's color is dimmed toward black in the death-cam. */
+const DOWN_DIM = 0.32;
 
 /** Live meshes keyed by entity id, mirroring the interpolated entity set. */
 const meshes = new Map<number, THREE.Mesh>();
@@ -149,49 +184,185 @@ function colorForId(id: number): THREE.Color {
   return new THREE.Color().setHSL(hue, 0.6, 0.55);
 }
 
-/** Create (once) the mesh for an entity and add it to the scene. */
-function createMesh(id: number, isLocal: boolean): THREE.Mesh {
-  const color = isLocal ? LOCAL_COLOR.clone() : colorForId(id);
+/**
+ * Desaturated, sickly green/olive for a zombie body. A slight per-id hue jitter
+ * keeps a horde from reading as one flat blob while staying firmly in the
+ * "infected" palette so zombies never look like the bright human colors.
+ */
+function zombieColorForId(id: number): THREE.Color {
+  const hue = 0.26 + ((id * 0.61803398875) % 1) * 0.06; // narrow green/olive band
+  return new THREE.Color().setHSL(hue, 0.32, 0.3);
+}
+
+/**
+ * Paint an entity's material for its TEAM and cache the resulting "base" colors
+ * on the mesh (`userData.baseColor` / `userData.baseEmissive`), so the per-frame
+ * state overlay in {@link applyEntityState} can always start from a clean team
+ * look. Called on spawn and again whenever an entity's `kind` flips (a human
+ * turning into a zombie — same id), which is what makes an infection visibly
+ * recolor the body mid-round.
+ *
+ * The LOCAL player is kept self-lit (a strong emissive glow) so you can always
+ * pick yourself out of a crowd; its base hue still tracks your team (spring
+ * green as a human -> toxic green as a zombie) so your own turn is visible too.
+ */
+function applyTeamMaterial(
+  mesh: THREE.Mesh,
+  isLocal: boolean,
+  kind: EntityKind,
+): void {
+  const material = mesh.material as THREE.MeshStandardMaterial;
+  const base = mesh.userData.baseColor as THREE.Color;
+  const baseEmissive = mesh.userData.baseEmissive as THREE.Color;
+  const id = mesh.userData.entityId as number;
+
+  if (isLocal) {
+    base.copy(kind === 'zombie' ? LOCAL_ZOMBIE_COLOR : LOCAL_COLOR);
+    // Strong self-glow marks "you" regardless of team.
+    baseEmissive.copy(base).multiplyScalar(0.3);
+  } else if (kind === 'zombie') {
+    base.copy(zombieColorForId(id));
+    // Faint sickly glow so zombies read as "infected" even in shadow.
+    baseEmissive.setHex(0x142808);
+  } else {
+    base.copy(colorForId(id));
+    baseEmissive.setHex(0x000000);
+  }
+
+  material.color.copy(base);
+  material.emissive.copy(baseEmissive);
+  mesh.userData.kind = kind;
+}
+
+/** Create (once) the mesh for an entity, paint it for its team, and add it. */
+function createMesh(id: number, isLocal: boolean, kind: EntityKind): THREE.Mesh {
   const material = new THREE.MeshStandardMaterial({
-    color,
     roughness: 0.5,
     metalness: 0.1,
-    emissive: isLocal ? LOCAL_COLOR.clone().multiplyScalar(0.25) : 0x000000,
   });
   const mesh = new THREE.Mesh(PLAYER_GEOMETRY, material);
   mesh.castShadow = true;
+  // Cache identity + reusable base-color scratch so we never re-allocate Colors
+  // per frame; the team paint fills them in below.
+  mesh.userData.entityId = id;
+  mesh.userData.baseColor = new THREE.Color();
+  mesh.userData.baseEmissive = new THREE.Color();
+  applyTeamMaterial(mesh, isLocal, kind);
   scene.add(mesh);
   meshes.set(id, mesh);
   return mesh;
 }
 
 /**
- * Reconcile Three.js meshes with the interpolated entity set: spawn new bodies,
- * update transforms (height shrinks while crawling; `y` lifts on a jump), and
- * dispose meshes for entities that have left. Returns the local player's feet
- * position for the follow camera, or `null` if the local entity isn't present.
+ * Apply one frame of an entity's transform + material for its movement/combat
+ * `state`. Every value is *assigned* (never accumulated) from the cached team
+ * base, so a state ending automatically restores the body next frame:
+ *
+ *   - `crawl` -> low profile;  `down` -> a dim, flattened pancake on the ground
+ *     (the death-cam pose);
+ *   - `attack` -> a quick forward lunge + emissive pop that sells the swing
+ *     (paired with the arc VFX spawned from the matching event);
+ *   - `stun` -> jitter-in-place, a little wobble, and an electric-yellow tint.
+ *
+ * `nowMs` (a {@link performance.now} reading) drives the time-based stun shake.
  */
-function syncEntities(): { x: number; y: number; z: number } | null {
-  const entities = connection.sampleEntities();
+function applyEntityState(
+  mesh: THREE.Mesh,
+  entity: InterpolatedEntity,
+  nowMs: number,
+): void {
+  const material = mesh.material as THREE.MeshStandardMaterial;
+  const base = mesh.userData.baseColor as THREE.Color;
+  const baseEmissive = mesh.userData.baseEmissive as THREE.Color;
+
+  // Start from the clean team look; overlays below tint on top of it.
+  material.color.copy(base);
+  material.emissive.copy(baseEmissive);
+
+  // Body profile + pose scratch, defaulted to a standing (or crawling) box.
+  let sx = 1;
+  let sy = entity.state === 'crawl' ? CRAWL_HEIGHT : PLAYER_HEIGHT;
+  let sz = 1;
+  let rotX = 0;
+  let rotZ = 0;
+  let dx = 0;
+  let dz = 0;
+  let yaw = entity.yaw;
+
+  switch (entity.state) {
+    case 'attack': {
+      // Lunge forward and thrust the box out along its facing.
+      rotX = -0.35;
+      sz = 1.25;
+      material.emissive.copy(base).multiplyScalar(0.45);
+      break;
+    }
+    case 'stun': {
+      // Rattled: a time-driven shake + wobble, tinted electric yellow.
+      const t = nowMs * 0.03;
+      dx = Math.sin(t) * 0.08;
+      dz = Math.cos(t * 1.3) * 0.08;
+      yaw += Math.sin(t * 0.7) * 0.25;
+      rotZ = Math.sin(t * 1.1) * 0.12;
+      material.emissive.copy(baseEmissive).lerp(STUN_TINT, 0.75);
+      break;
+    }
+    case 'down': {
+      // Death-cam: a dim pancake resting on the ground.
+      sx = 1.35;
+      sy = 0.2;
+      sz = 1.35;
+      material.color.copy(base).multiplyScalar(DOWN_DIM);
+      material.emissive.setHex(0x000000);
+      break;
+    }
+    default:
+      break;
+  }
+
+  mesh.scale.set(sx, sy, sz);
+  // `entity.y` is feet height (0 on the ground, >0 mid-jump); the box is
+  // centered, so lift it by half its scaled height to rest the base there.
+  // The stun shake nudges x/z only, never the resting height.
+  mesh.position.set(entity.x + dx, entity.y + sy / 2, entity.z + dz);
+  // rotation.order stays the default 'XYZ'; yaw is the dominant term.
+  mesh.rotation.set(rotX, yaw, rotZ);
+}
+
+/**
+ * Reconcile Three.js meshes with the interpolated entity set: spawn new bodies,
+ * repaint any whose team (`kind`) flipped this frame, drive their combat pose
+ * via {@link applyEntityState}, and dispose meshes for entities that have left.
+ * Returns the local player's feet position for the follow camera, or `null` if
+ * the local entity isn't present. `nowMs` (a {@link performance.now} reading)
+ * feeds the stun animation.
+ */
+function syncEntities(
+  entities: Map<number, InterpolatedEntity>,
+  nowMs: number,
+): { x: number; y: number; z: number } | null {
   const localId = connection.playerId;
   let localFeet: { x: number; y: number; z: number } | null = null;
 
   for (const entity of entities.values()) {
     const isLocal = entity.id === localId;
-    const mesh = meshes.get(entity.id) ?? createMesh(entity.id, isLocal);
+    const mesh =
+      meshes.get(entity.id) ?? createMesh(entity.id, isLocal, entity.kind);
 
-    // Crawling presents a low profile; standing bodies are full height.
-    const bodyHeight = entity.state === 'crawl' ? CRAWL_HEIGHT : PLAYER_HEIGHT;
-    mesh.scale.set(1, bodyHeight, 1);
-    // `entity.y` is the feet height (0 on the ground, >0 mid-jump); the box is
-    // centered, so lift it by half its scaled height to rest the base there.
-    mesh.position.set(entity.x, entity.y + bodyHeight / 2, entity.z);
-    mesh.rotation.y = entity.yaw;
+    // A human turning into a zombie keeps its id but changes `kind`; repaint the
+    // body (and its cached base colors) the instant that flip is observed so the
+    // infection is visible.
+    if (mesh.userData.kind !== entity.kind) {
+      applyTeamMaterial(mesh, isLocal, entity.kind);
+    }
+
+    applyEntityState(mesh, entity, nowMs);
 
     if (isLocal) localFeet = { x: entity.x, y: entity.y, z: entity.z };
   }
 
-  // Remove departed entities.
+  // Remove departed entities. Only the per-entity MATERIAL is disposed — the
+  // shared PLAYER_GEOMETRY is reused by every body and must never be disposed.
   for (const [id, mesh] of meshes) {
     if (!entities.has(id)) {
       scene.remove(mesh);
@@ -201,6 +372,185 @@ function syncEntities(): { x: number; y: number; z: number } | null {
   }
 
   return localFeet;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Combat VFX — short-lived meshes spawned from server events                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * One live visual effect: a throwaway mesh that grows and/or spins as it ages
+ * and fades out over its lifetime, after which it is removed and its geometry +
+ * material are disposed. Each effect owns UNIQUE geometry, so disposal can never
+ * touch the shared PLAYER_GEOMETRY. {@link updateEffects} advances the pool.
+ */
+interface Effect {
+  mesh: THREE.Mesh;
+  /** Remaining lifetime in ms; the effect dies at <= 0. */
+  ttl: number;
+  /** Initial lifetime in ms, for the fade + growth curves. */
+  maxTtl: number;
+  /** Uniform scale added per ms of age (0 = hold size). */
+  growPerMs: number;
+  /** Yaw spin in radians per ms of frame time (0 = hold facing). */
+  spinPerMs: number;
+}
+
+/** Live effect pool, advanced + culled every frame. */
+const effects: Effect[] = [];
+
+/**
+ * Register a freshly built effect mesh: remember its starting uniform scale (the
+ * growth curve multiplies it) and add it to the scene. `ttlMs` is its lifetime;
+ * `grow`/`spin` shape its age animation.
+ */
+function addEffect(
+  mesh: THREE.Mesh,
+  ttlMs: number,
+  grow: number,
+  spin: number,
+): void {
+  mesh.userData.baseScale = mesh.scale.x;
+  effects.push({ mesh, ttl: ttlMs, maxTtl: ttlMs, growPerMs: grow, spinPerMs: spin });
+  scene.add(mesh);
+}
+
+/** Advance every effect by `dtMs`, fading + growing it, and reap the expired. */
+function updateEffects(dtMs: number): void {
+  for (let i = effects.length - 1; i >= 0; i -= 1) {
+    const fx = effects[i];
+    fx.ttl -= dtMs;
+    if (fx.ttl <= 0) {
+      scene.remove(fx.mesh);
+      fx.mesh.geometry.dispose();
+      (fx.mesh.material as THREE.Material).dispose();
+      effects.splice(i, 1);
+      continue;
+    }
+    const age = fx.maxTtl - fx.ttl;
+    const life = fx.ttl / fx.maxTtl; // 1 -> 0 over the lifetime
+    const baseScale = fx.mesh.userData.baseScale as number;
+    fx.mesh.scale.setScalar(baseScale * (1 + fx.growPerMs * age));
+    fx.mesh.rotation.y += fx.spinPerMs * dtMs;
+    (fx.mesh.material as THREE.MeshBasicMaterial).opacity = life;
+  }
+}
+
+/**
+ * A translucent "swing sweep" laid flat on the ground in front of the swinger,
+ * oriented by their facing `yaw`, that flares and fades over ~220 ms. Uses the
+ * `YXZ` euler order so `yaw` spins about world-up *before* the sector is tilted
+ * flat, keeping the arc pointed the way the attacker faces.
+ */
+function spawnSwingVfx(x: number, y: number, z: number, yaw: number): void {
+  const geo = new THREE.CircleGeometry(1.4, 20, -1.2, 2.4); // ~137 deg sector
+  const mat = new THREE.MeshBasicMaterial({
+    color: 0xffb347,
+    transparent: true,
+    opacity: 0.55,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.rotation.order = 'YXZ';
+  mesh.rotation.y = yaw;
+  mesh.rotation.x = -Math.PI / 2; // lay the sector flat on the ground plane
+  // Nudge the sweep forward of the swinger; forward(yaw) = (-sin, 0, -cos).
+  mesh.position.set(x - Math.sin(yaw) * 0.6, y + 0.06, z - Math.cos(yaw) * 0.6);
+  addEffect(mesh, 220, 0.0009, 0);
+}
+
+/** A bright spinning halo-ring over a stunned target that swells + fades (~320 ms). */
+function spawnStunVfx(x: number, y: number, z: number): void {
+  const geo = new THREE.TorusGeometry(0.35, 0.06, 8, 20);
+  const mat = new THREE.MeshBasicMaterial({
+    color: 0xffe14a,
+    transparent: true,
+    opacity: 0.85,
+    depthWrite: false,
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.rotation.x = -Math.PI / 2; // lie flat like a halo above the head
+  mesh.position.set(x, y + 1.3, z);
+  addEffect(mesh, 320, 0.0016, 0.02);
+}
+
+/** A sickly-green wireframe burst at a freshly infected victim (~460 ms). */
+function spawnInfectVfx(x: number, y: number, z: number): void {
+  const geo = new THREE.IcosahedronGeometry(0.5, 0);
+  const mat = new THREE.MeshBasicMaterial({
+    color: 0x76ff5a,
+    wireframe: true,
+    transparent: true,
+    opacity: 0.9,
+    depthWrite: false,
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.set(x, y + 0.9, z);
+  addEffect(mesh, 460, 0.004, 0.012);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Kill / turn feed — a small stack of recent, self-expiring lines             */
+/* -------------------------------------------------------------------------- */
+
+/** How long a feed line stays up before it has fully faded, in ms. */
+const FEED_TTL_MS = 6000;
+
+/** Cap on feed lines kept on screen (newest win). */
+const FEED_MAX_LINES = 5;
+
+/** One turn-feed line with its own countdown; newest are unshifted to the top. */
+interface FeedLine {
+  text: string;
+  ttl: number;
+}
+
+const feedLines: FeedLine[] = [];
+
+const feed = document.createElement('div');
+Object.assign(feed.style, {
+  position: 'fixed',
+  bottom: '12px',
+  left: '12px',
+  padding: '8px 12px',
+  font: '12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace',
+  color: '#e6d2d2',
+  background: 'rgba(5, 7, 10, 0.72)',
+  border: '1px solid rgba(106, 58, 58, 0.5)',
+  borderRadius: '6px',
+  pointerEvents: 'none',
+  userSelect: 'none',
+  whiteSpace: 'pre',
+  backdropFilter: 'blur(2px)',
+  maxWidth: '320px',
+} satisfies Partial<CSSStyleDeclaration>);
+feed.style.display = 'none'; // hidden until the first event lands
+app.appendChild(feed);
+
+/** Push a new line onto the turn feed, trimming to the newest {@link FEED_MAX_LINES}. */
+function pushFeedLine(text: string): void {
+  feedLines.unshift({ text, ttl: FEED_TTL_MS });
+  if (feedLines.length > FEED_MAX_LINES) feedLines.length = FEED_MAX_LINES;
+}
+
+/** Age out feed lines and re-render (newest on top, each fading over its last second). */
+function updateFeed(dtMs: number): void {
+  for (let i = feedLines.length - 1; i >= 0; i -= 1) {
+    feedLines[i].ttl -= dtMs;
+    if (feedLines[i].ttl <= 0) feedLines.splice(i, 1);
+  }
+  if (feedLines.length === 0) {
+    feed.style.display = 'none';
+    return;
+  }
+  feed.style.display = 'block';
+  feed.innerHTML = feedLines
+    .map((line) => {
+      const alpha = Math.min(1, line.ttl / 1000).toFixed(2);
+      return `<div style="opacity:${alpha}">${line.text}</div>`;
+    })
+    .join('');
 }
 
 /* -------------------------------------------------------------------------- */
@@ -238,20 +588,40 @@ function statusColor(status: string): string {
   }
 }
 
-function updateHud(): void {
+/**
+ * Refresh the status HUD. Team counts are derived from the interpolated entity
+ * `kind`s each frame (downed humans are excluded from "alive"), which keeps the
+ * readout correct even if the server never sends a ROUND message. Your own team
+ * comes from your entity's `kind`.
+ */
+function updateHud(entities: Map<number, InterpolatedEntity>): void {
   const status = connection.status;
   const lookHint = controls.pointerLocked
     ? 'mouse: look (Esc releases)'
     : 'click canvas to look';
+
+  // Live team tally from the entity set (downed humans no longer count alive).
+  let humansAlive = 0;
+  let zombieCount = 0;
+  for (const e of entities.values()) {
+    if (e.kind === 'zombie') zombieCount += 1;
+    else if (e.state !== 'down') humansAlive += 1;
+  }
+  const localId = connection.playerId;
+  const me = localId !== null ? entities.get(localId) : undefined;
+  const team = me ? me.kind : '—';
+
   hud.innerHTML =
     `<span style="color:${statusColor(status)}">●</span> ` +
-    `<b>The Crawling Dark</b> · M2\n` +
+    `<b>The Crawling Dark</b> · M3\n` +
     `status    ${status}\n` +
     `playerId  ${connection.playerId ?? '—'}\n` +
-    `entities  ${connection.entityCount}\n` +
+    `team      ${team}\n` +
+    `humans    ${humansAlive}    zombies   ${zombieCount}\n` +
     `tick      ${connection.tick}\n` +
     `rtt       ${connection.rttMs > 0 ? `${Math.round(connection.rttMs)} ms` : '—'}\n` +
     `move      WASD · Shift run · C crawl${controls.crawling ? ' [on]' : ''} · Space jump\n` +
+    `combat    Left-click: swing bat\n` +
     `${lookHint}`;
 }
 
@@ -274,6 +644,8 @@ const clock = new THREE.Clock();
 
 function animate(): void {
   const dt = clock.getDelta();
+  const dtMs = dt * 1000;
+  const now = performance.now();
 
   // 1. Push this frame's input (held-key bitmask + look yaw) to the server.
   connection.sendInput(controls.keys, dt, controls.yaw);
@@ -281,16 +653,55 @@ function animate(): void {
   // 2. Build the town once we know the seed.
   ensureWorld();
 
-  // 3. Reconcile meshes with the interpolated world; get the local player's pos.
-  const localFeet = syncEntities();
+  // 3. Sample the interpolated world once; reused for events, meshes, and HUD.
+  const entities = connection.sampleEntities(now);
 
-  // 4. Drive the third-person camera when we have a local body and the town.
+  // 4. Turn this frame's server events into VFX + turn-feed lines. Positions
+  //    fall back to the actor/target entity when an event omits coordinates.
+  for (const ev of connection.drainEvents()) {
+    switch (ev.kind) {
+      case 'attack': {
+        const src = ev.actorId !== undefined ? entities.get(ev.actorId) : undefined;
+        spawnSwingVfx(
+          ev.x ?? src?.x ?? 0,
+          ev.y ?? src?.y ?? 0,
+          ev.z ?? src?.z ?? 0,
+          src?.yaw ?? 0,
+        );
+        break;
+      }
+      case 'stun': {
+        const tgt = ev.targetId !== undefined ? entities.get(ev.targetId) : undefined;
+        spawnStunVfx(ev.x ?? tgt?.x ?? 0, ev.y ?? tgt?.y ?? 0, ev.z ?? tgt?.z ?? 0);
+        pushFeedLine(`#${ev.actorId ?? '?'} stunned #${ev.targetId ?? '?'} 🦇`);
+        break;
+      }
+      case 'infect': {
+        const tgt = ev.targetId !== undefined ? entities.get(ev.targetId) : undefined;
+        spawnInfectVfx(ev.x ?? tgt?.x ?? 0, ev.y ?? tgt?.y ?? 0, ev.z ?? tgt?.z ?? 0);
+        pushFeedLine(`Player #${ev.targetId ?? '?'} was turned 🧟`);
+        break;
+      }
+      default:
+        // jump / roundStart / roundEnd — no client VFX for these yet.
+        break;
+    }
+  }
+
+  // 5. Reconcile meshes with the interpolated world; get the local player's pos.
+  const localFeet = syncEntities(entities, now);
+
+  // 6. Advance transient combat VFX and the turn feed, culling the expired.
+  updateEffects(dtMs);
+  updateFeed(dtMs);
+
+  // 7. Drive the third-person camera when we have a local body and the town.
   if (localFeet !== null && world !== null) {
     follow.update(localFeet, controls.yaw, world, dt);
   }
 
-  // 5. Refresh the HUD.
-  updateHud();
+  // 8. Refresh the HUD (team + live counts derived from the entity set).
+  updateHud(entities);
 
   renderer.render(scene, camera);
 }
