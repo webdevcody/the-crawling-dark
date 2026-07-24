@@ -328,3 +328,109 @@ export function collideCircleXZ(
 
   return { x: px, z: pz };
 }
+
+/* -------------------------------------------------------------------------- */
+/* Ray / segment queries (AI perception: avoidance & line-of-sight)            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Slab-method ray-vs-AABB on the XZ plane. Casts a ray from `(ox, oz)` along the
+ * UNIT direction `(dx, dz)` and returns the distance to the first intersection
+ * with `aabb`, or `null` when the ray misses (or the box lies entirely behind
+ * the origin). The box may be inflated by `pad` meters on every side (a Minkowski
+ * expansion) so a circle of that radius can be treated as a point — used to keep
+ * the NPC's avoidance probes a body-width clear of walls.
+ *
+ * Returns `0` when the origin already sits inside the padded box.
+ */
+export function rayAABB(
+  ox: number,
+  oz: number,
+  dx: number,
+  dz: number,
+  aabb: AABB,
+  pad = 0,
+): number | null {
+  const minX = aabb.minX - pad;
+  const maxX = aabb.maxX + pad;
+  const minZ = aabb.minZ - pad;
+  const maxZ = aabb.maxZ + pad;
+
+  // Origin already inside the padded box → contact at distance 0.
+  if (ox >= minX && ox <= maxX && oz >= minZ && oz <= maxZ) return 0;
+
+  // Intersect the ray against the X and Z slabs. A zero direction component means
+  // the ray is parallel to that slab: it can only ever hit if the origin already
+  // lies within the slab's extent, otherwise it misses outright.
+  let tmin = -Infinity;
+  let tmax = Infinity;
+
+  if (dx !== 0) {
+    const tx1 = (minX - ox) / dx;
+    const tx2 = (maxX - ox) / dx;
+    tmin = Math.max(tmin, Math.min(tx1, tx2));
+    tmax = Math.min(tmax, Math.max(tx1, tx2));
+  } else if (ox < minX || ox > maxX) {
+    return null;
+  }
+
+  if (dz !== 0) {
+    const tz1 = (minZ - oz) / dz;
+    const tz2 = (maxZ - oz) / dz;
+    tmin = Math.max(tmin, Math.min(tz1, tz2));
+    tmax = Math.min(tmax, Math.max(tz1, tz2));
+  } else if (oz < minZ || oz > maxZ) {
+    return null;
+  }
+
+  // No overlap of the slab intervals, or the box is behind the ray origin.
+  if (tmax < tmin || tmax < 0) return null;
+  return tmin >= 0 ? tmin : 0;
+}
+
+/**
+ * Cast a ray of length `maxDist` from `(ox, oz)` along the UNIT direction
+ * `(dx, dz)` against every building collider, returning the distance to the
+ * nearest hit — clamped to `maxDist` when the ray travels that far unobstructed.
+ * `pad` inflates each box (see {@link rayAABB}). Perimeter walls are NOT
+ * colliders (they are a position clamp, see {@link generateWorld}), so they are
+ * intentionally excluded, exactly like movement collision.
+ */
+export function raycastBuildings(
+  world: World,
+  ox: number,
+  oz: number,
+  dx: number,
+  dz: number,
+  maxDist: number,
+  pad = 0,
+): number {
+  let nearest = maxDist;
+  for (let i = 0; i < world.colliders.length; i++) {
+    const t = rayAABB(ox, oz, dx, dz, world.colliders[i], pad);
+    if (t !== null && t < nearest) nearest = t;
+  }
+  return nearest;
+}
+
+/**
+ * True when the straight segment from `(x0, z0)` to `(x1, z1)` is unobstructed
+ * by every building — i.e. the two points have clear line of sight on the XZ
+ * plane. The NPC uses this for target acquisition (t4b): a human is only
+ * "visible" when no building stands between it and the zombie.
+ */
+export function hasLineOfSight(
+  world: World,
+  x0: number,
+  z0: number,
+  x1: number,
+  z1: number,
+): boolean {
+  const dx = x1 - x0;
+  const dz = z1 - z0;
+  const dist = Math.hypot(dx, dz);
+  if (dist < 1e-6) return true;
+  const hit = raycastBuildings(world, x0, z0, dx / dist, dz / dist, dist, 0);
+  // Clear iff nothing was struck before the ray reached the target point.
+  return hit >= dist - 1e-4;
+}
