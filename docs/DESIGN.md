@@ -479,3 +479,69 @@ modules land the work; `main.ts` wires them together (t14e).
 All four systems are constructed once after the renderer/scene/camera, advanced
 in the frame loop, and disposed on `beforeunload`. `pnpm typecheck` + `pnpm
 build` stay green; the bundle grows ~30 KB (gzip) from the postprocessing addons.
+
+
+## M15 notes (Phase 2 — HUD & UX Polish)
+
+Milestone **M15** adds the missing **HUD & UX layer** over the M8–M14 base. Like
+M14 it is deliberately **client-only**: no protocol, server, or gameplay-balance
+change. Four disjoint modules land the work and `main.ts` wires them together
+(t15e), each reading only existing client state (the interpolated entity set, the
+seeded `World`, the `ROUND` message, and the local look/lock state).
+
+### Radar minimap (t15a)
+
+- **`client/src/ui/Minimap.ts`** is a top-right, dpr-crisp `<canvas>` overlay
+  (click-through, dark/rounded/blurred to match the HUD). Each frame it draws a
+  **player-centered, north-up radar** (`RADAR_RANGE_M = 44`, world +Z drawn
+  downward, circular clip): the lake disc, roads, and building footprints from the
+  `World`, then entity blips — **green** humans, **red** zombies — with the local
+  player a bright wedge pointing along the look yaw and an amber north tick.
+- Range-culls everything outside the radar disc and iterates the entity/building
+  lists in place, so it stays cheap; before the world/local body exist it draws a
+  faint "no signal" dish instead of throwing. Visibility follows the `minimap`
+  preference (below) and the `N` shortcut; hidden ⇒ `update` is a no-op.
+
+### Scoreboard / roster (t15b)
+
+- **`client/src/ui/Scoreboard.ts`** is a centered, click-through modal shown while
+  **`Tab` is held**. A header summarizes the round (`humans N · infected N · mm:ss
+  | phase`, degrading to `—` before the first `ROUND`), and the body lists every
+  entity — **humans first, then id** — with a team dot, `#id`, a `you` highlight on
+  the local row, the team, and a status derived from the movement `state`
+  (`down` → downed, `stun` → stunned, `crawl` → crawling, …). The shell is built
+  once; rows are rebuilt (`replaceChildren`) only while the board is visible.
+
+### Settings / options menu + persisted preferences (t15c)
+
+- **`client/src/ui/Settings.ts`** is a tiny **localStorage-backed** preference
+  store (key `tcd.settings.v1`) that is **offline-safe** (all storage access is
+  `try/catch`, degrading to in-memory). Keys + defaults: `postProcessing` (`true`),
+  `minimap` (`true`), `mouseSensitivity` (`0.0022`, clamped to `0.0005..0.01`), and
+  `renderQuality` (`'high'`). `set` persists the whole state and notifies
+  subscribers **only on a real change**.
+- **`client/src/ui/SettingsMenu.ts`** is a centered, **interactive**
+  (`pointer-events:auto`) modal toggled with `O` (and `Esc`-to-close), whose
+  controls two-way bind to the store: a post-processing toggle, a minimap toggle, a
+  sensitivity slider, and a low/medium/high quality selector.
+- `main.ts` **applies** each preference to the real systems in `applySetting`
+  (once at startup, then on every change): `postFx.enabled`,
+  `controls.setSensitivity` (new `Controls` hook), and — for quality — a
+  device-pixel-ratio cap (`low 1 · medium 1.5 · high 2`) via
+  `renderer.setPixelRatio` kept in lock-step with `postFx.setSize`. The `P` and
+  `N` shortcuts write **through** the store so the menu always agrees.
+
+### Combat reticle + objective banner (t15d)
+
+- **`client/src/ui/Reticle.ts`** draws a center crosshair (an inline SVG mutated
+  by attribute/opacity only — zero node churn) that **empties/reddens on a swing**
+  and sweeps its recharge arc closed back to ready-green over `ATTACK_COOLDOWN_MS`
+  (fed by `reticle.onSwing()` at the local attack), plus a bottom-center
+  **objective** line driven by phase + team (`Survive M:SS` for humans, "Infect the
+  survivors" for zombies, lobby/countdown/ended copy otherwise). The crosshair
+  shows only while pointer-locked and actually playing.
+
+Each module is constructed once after the renderer/scene/camera, advanced in the
+frame loop (a no-op while hidden), and disposed on `beforeunload`; the new
+shortcuts (`O` options · `Tab` scores · `N` map) are also surfaced in the HUD's
+controls hint. `pnpm typecheck` + `pnpm build` stay green.

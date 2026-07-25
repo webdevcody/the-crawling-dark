@@ -226,6 +226,8 @@ export class HUD {
 
     this.addStatic('move', 'WASD · Shift run · C crawl · Space jump');
     this.addStatic('combat', 'Left-click: swing bat');
+    // M15: surface the new HUD/UX shortcuts so they're discoverable.
+    this.addStatic('ui', 'O options · Tab scores · N map · P bloom');
     this.readyHint = this.addRow('ready');
     // The look hint sits on its own full-width line (no label column), like the
     // old HUD's trailing hint.

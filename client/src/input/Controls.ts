@@ -40,7 +40,11 @@ const KEY_MAP: Readonly<Record<string, InputKey | undefined>> = {
   Space: InputKey.Jump,
 };
 
-/** Look sensitivity in radians of yaw per pixel of horizontal mouse motion. */
+/**
+ * Default look sensitivity in radians of yaw per pixel of horizontal mouse
+ * motion. Used as the initial value for the per-instance {@link Controls.setSensitivity}
+ * override (M15 · t15e wires it to the settings menu's sensitivity slider).
+ */
 const MOUSE_SENSITIVITY = 0.0022;
 
 /** Wrap an angle into (-π, π] so accumulated yaw can never grow unbounded. */
@@ -66,6 +70,12 @@ export class Controls {
   private yawValue = 0;
   /** Whether the pointer is currently locked to {@link lockElement}. */
   private locked = false;
+  /**
+   * Live mouse-look sensitivity (radians of yaw per pixel), overridable at
+   * runtime via {@link setSensitivity} so the M15 settings menu can tune it.
+   * Seeded with {@link MOUSE_SENSITIVITY}.
+   */
+  private sensitivity = MOUSE_SENSITIVITY;
   /** Element wired for click-to-lock, or `null` before/after attach. */
   private lockElement: HTMLElement | null = null;
   private readonly target: Window;
@@ -98,6 +108,16 @@ export class Controls {
   /** Whether the pointer is currently locked. */
   get pointerLocked(): boolean {
     return this.locked;
+  }
+
+  /**
+   * Override the mouse-look sensitivity (radians of yaw per pixel). Non-finite or
+   * non-positive values are ignored so a bad settings value can never freeze look.
+   */
+  setSensitivity(radiansPerPixel: number): void {
+    if (Number.isFinite(radiansPerPixel) && radiansPerPixel > 0) {
+      this.sensitivity = radiansPerPixel;
+    }
   }
 
   /**
@@ -181,6 +201,6 @@ export class Controls {
   /** Accumulate yaw from horizontal motion — only while pointer-locked. */
   private readonly onMouseMove = (ev: MouseEvent): void => {
     if (!this.locked) return;
-    this.yawValue = wrapAngle(this.yawValue - ev.movementX * MOUSE_SENSITIVITY);
+    this.yawValue = wrapAngle(this.yawValue - ev.movementX * this.sensitivity);
   };
 }
