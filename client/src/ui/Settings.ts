@@ -41,6 +41,12 @@ export interface SettingsState {
   /** Whether the corner minimap is drawn. */
   minimap: boolean;
   /**
+   * When true, the UI suppresses non-essential animations — overlay fades/slides,
+   * feed slide-ins — for motion-sensitive players. Essential, information-bearing
+   * updates still happen; only the motion flourish around them is dropped.
+   */
+  reducedMotion: boolean;
+  /**
    * Look sensitivity — radians of yaw applied per pixel of pointer movement.
    * Mirrors the current `Controls` `MOUSE_SENSITIVITY`. Always kept within
    * {@link MOUSE_SENSITIVITY_MIN}..{@link MOUSE_SENSITIVITY_MAX}.
@@ -77,6 +83,7 @@ export const RENDER_QUALITIES: readonly RenderQuality[] = ['low', 'medium', 'hig
 const DEFAULTS: Readonly<SettingsState> = {
   postProcessing: true,
   minimap: true,
+  reducedMotion: false,
   // The current Controls `MOUSE_SENSITIVITY`.
   mouseSensitivity: 0.0022,
   renderQuality: 'high',
@@ -201,6 +208,7 @@ export class Settings {
 
     if (typeof src.postProcessing === 'boolean') base.postProcessing = src.postProcessing;
     if (typeof src.minimap === 'boolean') base.minimap = src.minimap;
+    if (typeof src.reducedMotion === 'boolean') base.reducedMotion = src.reducedMotion;
 
     const ms = src.mouseSensitivity;
     if (typeof ms === 'number' && Number.isFinite(ms)) {

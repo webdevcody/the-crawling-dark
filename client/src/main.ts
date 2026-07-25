@@ -80,6 +80,12 @@ import { TitleScreen } from './ui/TitleScreen';
 import { HelpOverlay } from './ui/HelpOverlay';
 import { PauseMenu } from './ui/PauseMenu';
 import { KillFeed } from './ui/KillFeed';
+// M17 — Round Presentation & Accessibility (results screen, turn/death overlay,
+// round-start role reveal, and a reduced-motion accessibility gate).
+import { RoundEndScreen } from './ui/RoundEndScreen';
+import { TurnOverlay } from './ui/TurnOverlay';
+import { RoundIntro } from './ui/RoundIntro';
+import { prefersReducedMotion } from './ui/a11y';
 
 const app = document.querySelector<HTMLDivElement>('#app') ?? document.body;
 
@@ -361,6 +367,41 @@ document.addEventListener('pointerlockchange', () => {
   const locked = document.pointerLockElement === renderer.domElement;
   if (locked) pauseMenu.close();
   else if (!titleScreen.visible && !pauseMenu.visible) pauseMenu.open();
+});
+
+/* -------------------------------------------------------------------------- */
+/* M17 — Round Presentation & Accessibility                                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The end-of-round results card (M17 · t17a) — a larger victory/defeat summary
+ * (outcome, your personal result, final tally, return countdown) shown only
+ * while `phase === 'ended'`. Non-interactive; layered beneath the menus.
+ */
+const roundEndScreen = new RoundEndScreen(app);
+
+/** A brief "YOU HAVE BEEN TURNED" splash (M17 · t17b), fired on local infection. */
+const turnOverlay = new TurnOverlay(app);
+
+/** A one-time role-reveal intro (M17 · t17c) shown the frame a round goes active. */
+const roundIntro = new RoundIntro(app);
+
+/**
+ * Push the effective reduced-motion preference — the stored toggle OR the OS
+ * `prefers-reduced-motion` signal (via {@link prefersReducedMotion}) — into every
+ * animated overlay, so a motion-sensitive player's fades/slides are suppressed.
+ * Applied once at startup and again whenever the preference changes.
+ */
+function applyReducedMotion(): void {
+  const reduced = prefersReducedMotion(settings);
+  roundEndScreen.setReducedMotion(reduced);
+  turnOverlay.setReducedMotion(reduced);
+  roundIntro.setReducedMotion(reduced);
+  killFeed.setReducedMotion(reduced);
+}
+applyReducedMotion();
+const unsubscribeReducedMotion = settings.subscribe((key) => {
+  if (key === 'reducedMotion') applyReducedMotion();
 });
 
 /**
@@ -1377,6 +1418,7 @@ function animate(): void {
         particles.spores(x, y, z);
         if (ev.targetId === connection.playerId) {
           screenFx.infected();
+          turnOverlay.trigger(); // M17: the "you have been turned" moment splash
           cameraShake.addTrauma(0.8);
         } else {
           cameraShake.addTrauma(traumaByProximity(x, z, entities));
@@ -1436,6 +1478,9 @@ function animate(): void {
   // 6. Advance transient combat VFX and the turn feed, culling the expired.
   updateEffects(dtMs);
   killFeed.update(dtMs);
+  // M17: age the momentary round-presentation overlays (each a no-op while hidden).
+  turnOverlay.update(dtMs);
+  roundIntro.update(dtMs);
 
   // 6b. Ripple the lake surface (M9 · t9d) — a cheap UV scroll, no allocations.
   water?.update(dtMs);
@@ -1459,6 +1504,8 @@ function animate(): void {
     team: localTeam(entities),
     pointerLocked: controls.pointerLocked,
   });
+  // M17: the end-of-round results screen — visible only while phase === 'ended'.
+  roundEndScreen.update({ round: connection.round, team: localTeam(entities) });
 
   // 7. Drive the third-person camera when we have a local body and the town.
   if (localFeet !== null && world !== null) {
@@ -1476,6 +1523,8 @@ function animate(): void {
   const round = connection.round;
   const phase = round?.phase ?? null;
   if (phase === 'lobby' && lastPhase !== 'lobby') localReady = false;
+  // M17: fire the one-time role-reveal intro the frame a round goes active.
+  if (phase === 'active' && lastPhase !== 'active') roundIntro.trigger(localTeam(entities));
   lastPhase = phase;
 
   hud.update({
@@ -1536,4 +1585,9 @@ window.addEventListener('beforeunload', () => {
   helpOverlay.dispose();
   pauseMenu.dispose();
   killFeed.dispose();
+  // M17: free the round-presentation overlays + the reduced-motion subscription.
+  roundEndScreen.dispose();
+  turnOverlay.dispose();
+  roundIntro.dispose();
+  unsubscribeReducedMotion();
 });

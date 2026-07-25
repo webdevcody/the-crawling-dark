@@ -2,11 +2,11 @@
  * The Crawling Dark — options menu overlay (M15 · t15c).
  *
  * `SettingsMenu` is a centered modal panel that edits a {@link Settings} store:
- * a post-processing toggle, a minimap toggle, a mouse-sensitivity slider, and a
- * three-way render-quality selector. It is styled to match the HUD / audio-panel
- * idioms — dark, translucent, monospace, blurred — but, like {@link AudioControls}
- * and unlike the click-through HUD, it opts back into pointer events so its
- * controls are usable.
+ * a post-processing toggle, a minimap toggle, a reduced-motion toggle, a
+ * mouse-sensitivity slider, and a three-way render-quality selector. It is
+ * styled to match the HUD / audio-panel idioms — dark, translucent, monospace,
+ * blurred — but, like {@link AudioControls} and unlike the click-through HUD, it
+ * opts back into pointer events so its controls are usable.
  *
  * The menu is a **thin, two-way-bound view** over the store and nothing more:
  * every control reflects the current preference when the panel opens, and writing
@@ -64,6 +64,7 @@ export class SettingsMenu {
   private readonly panel: HTMLDivElement;
   private readonly postButton: HTMLButtonElement;
   private readonly minimapButton: HTMLButtonElement;
+  private readonly reducedMotionButton: HTMLButtonElement;
   private readonly sensSlider: HTMLInputElement;
   private readonly sensValue: HTMLSpanElement;
   /** One button per {@link RenderQuality}, keyed for the active-state repaint. */
@@ -130,6 +131,12 @@ export class SettingsMenu {
       this.settings.set('minimap', !this.settings.get('minimap'));
     });
 
+    // Reduced-motion toggle — suppresses non-essential UI animations.
+    this.reducedMotionButton = SettingsMenu.makeButton();
+    this.reducedMotionButton.addEventListener('click', () => {
+      this.settings.set('reducedMotion', !this.settings.get('reducedMotion'));
+    });
+
     // Mouse sensitivity — a range over [MIN, MAX] with a live numeric readout.
     this.sensSlider = document.createElement('input');
     this.sensSlider.type = 'range';
@@ -178,6 +185,7 @@ export class SettingsMenu {
     this.panel.append(
       SettingsMenu.makeRow('post-fx', this.postButton),
       SettingsMenu.makeRow('minimap', this.minimapButton),
+      SettingsMenu.makeRow('reduced', this.reducedMotionButton),
       SettingsMenu.makeRow('mouse', sensGroup),
       SettingsMenu.makeRow('quality', qualityGroup),
     );
@@ -247,6 +255,7 @@ export class SettingsMenu {
     const state = this.settings.getAll();
     SettingsMenu.paintToggle(this.postButton, state.postProcessing);
     SettingsMenu.paintToggle(this.minimapButton, state.minimap);
+    SettingsMenu.paintToggle(this.reducedMotionButton, state.reducedMotion);
     this.sensSlider.value = String(state.mouseSensitivity);
     this.sensValue.textContent = state.mouseSensitivity.toFixed(4);
     for (const [quality, btn] of this.qualityButtons) {
