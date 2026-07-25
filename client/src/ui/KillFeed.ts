@@ -86,6 +86,8 @@ export class KillFeed {
   private lastShown: boolean | null = null;
   /** Guards against use after {@link dispose} (also makes dispose idempotent). */
   private disposed = false;
+  /** When true, {@link push}'s one-shot enter animation is suppressed (M17 a11y). */
+  private reducedMotion = false;
 
   constructor(container: HTMLElement) {
     // A compact, translucent, click-through stack pinned to the bottom-left —
@@ -144,19 +146,29 @@ export class KillFeed {
     // opacity + transform so it never fights the ttl-driven opacity we manage per
     // frame (which sits at 1 for a fresh line anyway). Guarded for environments
     // without the Web Animations API (e.g. jsdom in tests).
-    el.animate?.(
-      [
-        { opacity: 0, transform: 'translateX(-8px)' },
-        { opacity: 1, transform: 'translateX(0)' },
-      ],
-      { duration: 220, easing: 'cubic-bezier(0.2, 0.7, 0.2, 1)' },
-    );
+    if (!this.reducedMotion) {
+      el.animate?.(
+        [
+          { opacity: 0, transform: 'translateX(-8px)' },
+          { opacity: 1, transform: 'translateX(0)' },
+        ],
+        { duration: 220, easing: 'cubic-bezier(0.2, 0.7, 0.2, 1)' },
+      );
+    }
 
     // Trim to the newest FEED_MAX_LINES, dropping (and detaching) the oldest.
     while (this.lines.length > FEED_MAX_LINES) {
       const dropped = this.lines.pop();
       dropped?.el.remove();
     }
+  }
+
+  /**
+   * Toggle the one-shot enter animation off (or back on). Under reduced motion
+   * {@link push} skips the fade/slide-in and new lines simply appear in place.
+   */
+  setReducedMotion(reduced: boolean): void {
+    this.reducedMotion = reduced;
   }
 
   /* ---- Per-frame update ------------------------------------------------- */

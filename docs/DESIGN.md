@@ -603,3 +603,76 @@ title `50` > pause `49` > help `48` > settings `20` > reticle `11` > screen-fx `
 All four modules construct once after the renderer/scene/camera, update as no-ops
 while hidden, and are disposed on `beforeunload`; the HUD look-hint now advertises
 `Esc: menu · H: controls`. `pnpm typecheck` + `pnpm build` stay green.
+
+## M17 notes (Phase 2 — Round Presentation & Accessibility)
+
+Phase 2 continuation. A **client-side round-presentation & accessibility** batch
+on top of the M8–M16 base — the round loop now *reads* as a match with a real
+front-and-back: a role reveal when it starts, a moment of dread when you're
+turned, and a proper results screen when it ends, plus a reduced-motion switch
+for motion-sensitive players. Pure client-side UX polish: **no protocol, server,
+or gameplay-balance changes**, and everything matches the existing dark /
+translucent / monospace / blurred idiom shared by the HUD, `Scoreboard`,
+`SettingsMenu`, `Reticle`, and `KillFeed`. The new non-interactive overlays layer
+by `zIndex` beneath the interactive menus (title `50` > pause `49` > help `48` >
+settings `20`): turn-overlay `17` > round-intro `16` > round-end `15` > reticle
+`11` > screen-fx `10`.
+
+### Round-end results screen (t17a)
+
+- **`client/src/ui/RoundEndScreen.ts`** is a centered summary card shown only
+  while `round.phase === 'ended'` — richer than, and distinct from, the small
+  top-center HUD banner. It surfaces the outcome headline (HUMANS SURVIVED /
+  THE HORDE WINS / ROUND OVER, colored green/red/slate with an accent glow +
+  border tint), the player's **personal result** from their team (You survived
+  the night / You were turned / Spectating), a compact final tally
+  (`humans N · zombies N`), and the `Returning to lobby in Ns` countdown. It is
+  fed `{ round, team }` every frame via `roundEndScreen.update(...)`, plays a
+  one-shot fade/scale-in the first frame it becomes visible (WAAPI, guarded,
+  suppressed under reduced motion), and does zero work while hidden.
+
+### Turn / death moment overlay (t17b)
+
+- **`client/src/ui/TurnOverlay.ts`** is a brief centered **"YOU HAVE BEEN
+  TURNED"** splash fired from `main.ts` the instant the LOCAL player is infected,
+  alongside the existing `ScreenFx.infected()` flash and camera trauma. It holds
+  full for `HOLD_MS = 700`, then fades opacity 1→0 to `TOTAL_MS = 2500` (computed
+  from an internal `elapsedMs`, not a CSS transition, so a tab-switch spike can't
+  strand it on screen), and hides itself. A guarded scale pop-in runs on a nested
+  wrapper so it never fights the centering transform; reduced motion skips it.
+
+### Round-start role reveal intro (t17c)
+
+- **`client/src/ui/RoundIntro.ts`** is a one-time role reveal — a dramatic
+  `SURVIVE THE NIGHT` headline plus a team line (You are HUMAN — outlast the
+  horde · You are the HORDE — hunt them all · The night begins) with a
+  green/red/slate accent — fired the frame the round transitions to `active`
+  (`phase === 'active' && lastPhase !== 'active'`). It is distinct from the
+  persistent bottom objective banner in `Reticle.ts`: it holds for
+  `HOLD_MS = 1800`, fades to `TOTAL_MS = 3200`, then hides. Same guarded-WAAPI /
+  reduced-motion discipline as the other overlays.
+
+### Accessibility — reduced motion (t17d)
+
+- **`client/src/ui/Settings.ts`** gains a persisted `reducedMotion: boolean`
+  preference (default `false`), validated/merged like the existing fields so a
+  corrupt or stale blob can never crash the store — no storage-key bump needed
+  since a missing field cleanly falls back to the default.
+- **`client/src/ui/a11y.ts`** is a tiny pure helper: `prefersReducedMotion(settings)`
+  returns `settings.get('reducedMotion') || <OS prefers-reduced-motion>`, with the
+  `matchMedia` read guarded for non-browser/absent environments. It is the single
+  switch every animated overlay reads.
+- **`client/src/ui/SettingsMenu.ts`** adds a **Reduced motion** toggle, two-way
+  bound to the store like the other toggles (and reflecting external changes via
+  its existing `subscribe`).
+
+### Integration (t17e)
+
+- `main.ts` constructs the three overlays once after the renderer/scene/camera,
+  triggers/ages them from the event loop and the round-phase transition, feeds
+  the results screen `{ round, team }` each frame, and disposes them all on
+  `beforeunload`. An `applyReducedMotion()` helper pushes the effective
+  `prefersReducedMotion(settings)` value into all four animated modules — the
+  three new overlays **and** `KillFeed` (which gained a `setReducedMotion(...)`
+  that gates its enter animation) — once at startup and again on every settings
+  change. `pnpm typecheck` + `pnpm build` stay green.
