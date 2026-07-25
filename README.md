@@ -45,6 +45,11 @@ Then open the client URL that Vite prints (default http://localhost:5173).
 
 ## Milestones
 
-Development is tracked as milestones **M0 → M7** on GitHub. M0 (this scaffold) proves the
-toolchain end-to-end: a pnpm monorepo, a Vite + Three.js client rendering a lit ground
-plane, a `ws` server logging connections, and a `shared/` package both sides consume.
+Development is tracked as milestones on GitHub. **M0 → M7** build the playable game
+(scaffold, networking, movement, combat/infection, AI, round loop, prediction, netcode);
+**M8 → M15** are the Phase 2 polish batches (movement feel, world/environment, textures,
+sky/lighting, audio, characters, VFX/post-processing, and — M15 — the HUD & UX layer:
+a radar minimap, a Tab scoreboard, a persisted settings menu, and a combat reticle).
+M0 (the scaffold) proves the toolchain end-to-end: a pnpm monorepo, a Vite + Three.js
+client rendering a lit ground plane, a `ws` server logging connections, and a `shared/`
+package both sides consume.

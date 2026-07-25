@@ -68,6 +68,12 @@ import { PostFx } from './scene/PostFx';
 import { Particles } from './scene/Particles';
 import { CameraShake } from './scene/CameraShake';
 import { ScreenFx } from './ui/ScreenFx';
+// M15 — HUD & UX polish (radar minimap, scoreboard, settings menu, reticle).
+import { Minimap } from './ui/Minimap';
+import { Scoreboard } from './ui/Scoreboard';
+import { Settings, type RenderQuality, type SettingsState } from './ui/Settings';
+import { SettingsMenu } from './ui/SettingsMenu';
+import { Reticle } from './ui/Reticle';
 
 const app = document.querySelector<HTMLDivElement>('#app') ?? document.body;
 
@@ -196,6 +202,69 @@ controls.attachPointerLock(renderer.domElement);
 connection.connect();
 
 /* -------------------------------------------------------------------------- */
+/* M15 — HUD & UX polish (minimap, scoreboard, settings menu, reticle)          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Persisted client preferences (localStorage-backed, offline-safe). The single
+ * source of truth for the {@link settingsMenu}; each value is pushed into the
+ * real systems by {@link applySetting} once at startup and again on every change.
+ */
+const settings = new Settings();
+
+/** Render-quality tier → device-pixel-ratio cap (crisper but costlier up the scale). */
+const QUALITY_DPR_CAP: Readonly<Record<RenderQuality, number>> = {
+  low: 1,
+  medium: 1.5,
+  high: 2,
+};
+
+/** Corner radar minimap (top-right); visibility follows the `minimap` preference. */
+const minimap = new Minimap(app);
+
+/** Held-`Tab` scoreboard / player roster overlay. */
+const scoreboard = new Scoreboard(app);
+
+/** Center combat crosshair (swing-cooldown) + bottom objective banner. */
+const reticle = new Reticle(app);
+
+/** Options modal bound to {@link settings}; toggled with `O`. */
+const settingsMenu = new SettingsMenu(app, settings);
+
+/**
+ * Apply one preference to the live systems. Invoked for every key at startup and
+ * again from the {@link settings} subscription whenever a value actually changes,
+ * so the menu (and the `N` minimap shortcut) drive the real renderer/controls.
+ */
+function applySetting(key: keyof SettingsState): void {
+  switch (key) {
+    case 'postProcessing':
+      postFx.enabled = settings.get('postProcessing');
+      break;
+    case 'minimap':
+      minimap.setVisible(settings.get('minimap'));
+      break;
+    case 'mouseSensitivity':
+      controls.setSensitivity(settings.get('mouseSensitivity'));
+      break;
+    case 'renderQuality': {
+      const cap = QUALITY_DPR_CAP[settings.get('renderQuality')];
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, cap));
+      // Keep the post-processing composer's internal targets in lock-step with
+      // the renderer's new pixel ratio.
+      postFx.setSize(window.innerWidth, window.innerHeight);
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+// Push every stored preference into the live systems once, then keep them synced.
+(Object.keys(settings.getAll()) as (keyof SettingsState)[]).forEach(applySetting);
+const unsubscribeSettings = settings.subscribe((key) => applySetting(key));
+
+/* -------------------------------------------------------------------------- */
 /* Audio — procedural Web Audio (no assets); resumed on the first gesture       */
 /* -------------------------------------------------------------------------- */
 
@@ -266,6 +335,8 @@ renderer.domElement.addEventListener('mousedown', (ev) => {
   if (ev.button !== 0) return;
   if (!controls.pointerLocked) return;
   connection.sendAttack();
+  // M15: start the reticle's swing-cooldown recharge animation on our own swing.
+  reticle.onSwing();
 });
 
 /* -------------------------------------------------------------------------- */
@@ -805,6 +876,31 @@ window.addEventListener('keydown', (ev) => {
 window.addEventListener('keydown', (ev) => {
   if (ev.code !== 'KeyP' || ev.repeat) return;
   postFx.enabled = !postFx.enabled;
+  // Keep the settings store in step so the options menu reflects the `P` toggle.
+  settings.set('postProcessing', postFx.enabled);
+});
+
+/**
+ * M15 UX shortcuts, all window-level so they work with or without pointer lock:
+ *   - `Tab` (held) shows the scoreboard/roster; released hides it. `preventDefault`
+ *     stops the browser stealing the key for focus traversal.
+ *   - `O` toggles the options/settings modal.
+ *   - `N` toggles the minimap via the settings store (single source of truth), so
+ *     the options menu's minimap switch and this shortcut always agree.
+ * `repeat` is ignored on the toggles so a held key can't strobe them.
+ */
+window.addEventListener('keydown', (ev) => {
+  if (ev.code === 'Tab') {
+    ev.preventDefault();
+    scoreboard.setVisible(true);
+    return;
+  }
+  if (ev.repeat) return;
+  if (ev.code === 'KeyO') settingsMenu.toggle();
+  else if (ev.code === 'KeyN') settings.set('minimap', !settings.get('minimap'));
+});
+window.addEventListener('keyup', (ev) => {
+  if (ev.code === 'Tab') scoreboard.setVisible(false);
 });
 
 /* -------------------------------------------------------------------------- */
@@ -1348,6 +1444,19 @@ function animate(): void {
   screenFx.danger(dangerIntensity(entities, localFeet));
   screenFx.update(dtMs);
 
+  // 6d. M15: advance the HUD/UX overlays. Each is a cheap no-op while hidden
+  //     (minimap/scoreboard early-return unless shown), so calling them every
+  //     frame is fine. The minimap centers on the local player and faces its
+  //     look yaw; the scoreboard reads the roster + ROUND; the reticle tracks
+  //     the swing cooldown and shows a phase/team objective while playing.
+  minimap.update(world, entities, connection.playerId, controls.yaw);
+  scoreboard.update(entities, connection.playerId, connection.round);
+  reticle.update(dtMs, {
+    round: connection.round,
+    team: localTeam(entities),
+    pointerLocked: controls.pointerLocked,
+  });
+
   // 7. Drive the third-person camera when we have a local body and the town.
   if (localFeet !== null && world !== null) {
     follow.update(localFeet, controls.yaw, world, dt);
@@ -1412,4 +1521,11 @@ window.addEventListener('beforeunload', () => {
   particles.dispose();
   cameraShake.dispose();
   screenFx.dispose();
+  // M15: free the HUD/UX overlays + the settings subscription.
+  minimap.dispose();
+  scoreboard.dispose();
+  reticle.dispose();
+  settingsMenu.dispose();
+  unsubscribeSettings();
+  settings.dispose();
 });
