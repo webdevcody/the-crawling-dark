@@ -545,3 +545,61 @@ Each module is constructed once after the renderer/scene/camera, advanced in the
 frame loop (a no-op while hidden), and disposed on `beforeunload`; the new
 shortcuts (`O` options · `Tab` scores · `N` map) are also surfaced in the HUD's
 controls hint. `pnpm typecheck` + `pnpm build` stay green.
+
+---
+
+## M16 notes (Phase 2 — Menus & Onboarding)
+
+Phase 2 continuation. A **client-side onboarding & menus** batch on top of the
+M8–M15 base — a front door, a controls reference, a real `Esc` menu, and the
+kill/turn feed lifted into its own module. Pure client-side UX polish: **no
+protocol, server, or gameplay-balance changes**, and everything matches the
+existing dark / translucent / monospace / blurred idiom shared by the HUD,
+`AudioControls`, `Scoreboard`, and `SettingsMenu`. Overlays layer by `zIndex`:
+title `50` > pause `49` > help `48` > settings `20` > reticle `11` > screen-fx `10`.
+
+### Title / start screen (t16a)
+
+- **`client/src/ui/TitleScreen.ts`** is a full-viewport, **interactive**
+  (`pointer-events:auto`) overlay shown on first load that gates entry: the game
+  title, a one-line premise, a **Play** button, and a controls hint. `Play` (or
+  `Enter`/`Space`) hides it and fires `onPlay`. `main.ts` wires `onPlay` to the
+  first-gesture audio unlock (`resume` + `startAmbient` + `startMusic`) and a
+  `renderer.domElement.requestPointerLock()` so Play drops straight into mouse-look.
+
+### Controls / help reference overlay (t16b)
+
+- **`client/src/ui/keybindings.ts`** is a pure, zero-DOM **single source of truth**:
+  a typed `KEYBINDINGS` list grouped Movement / Combat / Interface, verified against
+  `Controls.ts` + `main.ts` (WASD move · `Shift` run · `C` crawl · `Space` jump ·
+  LMB swing · `R` ready · `Tab` scores · `O` options · `N` map · `P` post-fx ·
+  `M` mute · `` ` `` perf · `H`/`?` controls · `Esc` menu).
+- **`client/src/ui/HelpOverlay.ts`** renders that list as a centered modal card
+  (bordered key chips + action rows). Toggled with `H` (or `?`); closes on
+  `Esc`/`H`/`?`. Wired into the same window-level UX-shortcut handler as `O`/`N`.
+
+### Esc pause menu (t16c)
+
+- **`client/src/ui/PauseMenu.ts`** is a centered modal with **Resume / Controls /
+  Settings** buttons, kept **callback-driven** (it imports no other UI/system
+  module). `main.ts` supplies the behavior: Resume re-requests pointer lock,
+  Controls opens the help overlay, and Settings closes the pause panel then opens
+  the options modal (so the lower-`zIndex` settings modal isn't hidden behind it).
+- The trigger is a `main.ts` **`pointerlockchange`** hook: the browser drops
+  pointer lock on `Esc` (or tab-blur), and a mid-play exit — title dismissed, no
+  panel already up — opens the pause menu; re-acquiring the lock (Play/Resume)
+  closes it. This turns the previously-silent `Esc` into a real in-game menu.
+
+### Kill / turn feed module (t16d)
+
+- **`client/src/ui/KillFeed.ts`** extracts the feed that used to be inlined in
+  `main.ts` into a self-contained module with the **same semantics**
+  (`FEED_TTL_MS = 6000`, `FEED_MAX_LINES = 5`, newest-on-top, per-line
+  `min(1, ttl/1000)` fade, hidden when empty), plus polish: a left accent bar, a
+  one-shot fade/slide-in on push (WAAPI, guarded), and cached per-line nodes so a
+  steady feed does zero DOM writes. `main.ts` feeds it the same pre-formatted
+  strings via `killFeed.push(...)` and ages it with `killFeed.update(dt)`.
+
+All four modules construct once after the renderer/scene/camera, update as no-ops
+while hidden, and are disposed on `beforeunload`; the HUD look-hint now advertises
+`Esc: menu · H: controls`. `pnpm typecheck` + `pnpm build` stay green.

@@ -74,6 +74,12 @@ import { Scoreboard } from './ui/Scoreboard';
 import { Settings, type RenderQuality, type SettingsState } from './ui/Settings';
 import { SettingsMenu } from './ui/SettingsMenu';
 import { Reticle } from './ui/Reticle';
+// M16 — Menus & Onboarding (title screen, controls/help overlay, Esc pause menu,
+// and the kill/turn feed extracted into its own module).
+import { TitleScreen } from './ui/TitleScreen';
+import { HelpOverlay } from './ui/HelpOverlay';
+import { PauseMenu } from './ui/PauseMenu';
+import { KillFeed } from './ui/KillFeed';
 
 const app = document.querySelector<HTMLDivElement>('#app') ?? document.body;
 
@@ -301,6 +307,61 @@ audio.loadSamples({
 
 /** Bottom-right mute/volume panel; also binds `M` to toggle mute. */
 const audioControls = new AudioControls(app, audio);
+
+/* -------------------------------------------------------------------------- */
+/* M16 — Menus & Onboarding (title, controls/help, Esc pause, kill feed)        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Bottom-left kill / turn feed (M16 · t16d) — the same self-expiring stack that
+ * used to be inlined here, now its own module. Fed pre-formatted strings from the
+ * event loop ({@link Connection.drainEvents}) and aged out each frame.
+ */
+const killFeed = new KillFeed(app);
+
+/** Toggleable controls reference (M16 · t16b), opened with `H` / `?` or from the pause menu. */
+const helpOverlay = new HelpOverlay(app);
+
+/**
+ * Esc pause menu (M16 · t16c). The browser drops pointer lock on `Esc`; the
+ * {@link pointerlockchange} hook below turns that mid-play exit into an open
+ * pause panel. Its buttons route back into the live systems: Resume re-requests
+ * pointer lock, Controls opens the help overlay, and Settings opens the options
+ * modal — closing the pause panel first so it isn't hidden behind it (the pause
+ * panel rides a higher zIndex than the settings modal).
+ */
+const pauseMenu = new PauseMenu(app, {
+  onResume: () => renderer.domElement.requestPointerLock(),
+  onControls: () => helpOverlay.open(),
+  onSettings: () => {
+    pauseMenu.close();
+    settingsMenu.open();
+  },
+});
+
+/**
+ * Title / start screen (M16 · t16a), shown on first load and gating entry. Play
+ * counts as the first user gesture, so it unlocks audio and requests pointer lock
+ * to drop straight into mouse-look. Constructed LAST so it mounts on top.
+ */
+const titleScreen = new TitleScreen(app, () => {
+  audio.resume();
+  audio.startAmbient();
+  audio.startMusic();
+  renderer.domElement.requestPointerLock();
+});
+
+/**
+ * Turn a pointer-lock EXIT into a pause. The browser drops pointer lock on `Esc`
+ * (and on tab-blur); when that happens mid-play — the title is dismissed and no
+ * pause panel is already up — open the pause menu. Re-acquiring the lock (Play or
+ * Resume) closes it. Guarded so it never fires under the title screen or a menu.
+ */
+document.addEventListener('pointerlockchange', () => {
+  const locked = document.pointerLockElement === renderer.domElement;
+  if (locked) pauseMenu.close();
+  else if (!titleScreen.visible && !pauseMenu.visible) pauseMenu.open();
+});
 
 /**
  * Client-side prediction for the LOCAL player (M6 · t6a). Fed this frame's input
@@ -653,68 +714,8 @@ function spawnInfectVfx(x: number, y: number, z: number): void {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Kill / turn feed — a small stack of recent, self-expiring lines             */
-/* -------------------------------------------------------------------------- */
-
-/** How long a feed line stays up before it has fully faded, in ms. */
-const FEED_TTL_MS = 6000;
-
-/** Cap on feed lines kept on screen (newest win). */
-const FEED_MAX_LINES = 5;
-
-/** One turn-feed line with its own countdown; newest are unshifted to the top. */
-interface FeedLine {
-  text: string;
-  ttl: number;
-}
-
-const feedLines: FeedLine[] = [];
-
-const feed = document.createElement('div');
-Object.assign(feed.style, {
-  position: 'fixed',
-  bottom: '12px',
-  left: '12px',
-  padding: '8px 12px',
-  font: '12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace',
-  color: '#e6d2d2',
-  background: 'rgba(5, 7, 10, 0.72)',
-  border: '1px solid rgba(106, 58, 58, 0.5)',
-  borderRadius: '6px',
-  pointerEvents: 'none',
-  userSelect: 'none',
-  whiteSpace: 'pre',
-  backdropFilter: 'blur(2px)',
-  maxWidth: '320px',
-} satisfies Partial<CSSStyleDeclaration>);
-feed.style.display = 'none'; // hidden until the first event lands
-app.appendChild(feed);
-
-/** Push a new line onto the turn feed, trimming to the newest {@link FEED_MAX_LINES}. */
-function pushFeedLine(text: string): void {
-  feedLines.unshift({ text, ttl: FEED_TTL_MS });
-  if (feedLines.length > FEED_MAX_LINES) feedLines.length = FEED_MAX_LINES;
-}
-
-/** Age out feed lines and re-render (newest on top, each fading over its last second). */
-function updateFeed(dtMs: number): void {
-  for (let i = feedLines.length - 1; i >= 0; i -= 1) {
-    feedLines[i].ttl -= dtMs;
-    if (feedLines[i].ttl <= 0) feedLines.splice(i, 1);
-  }
-  if (feedLines.length === 0) {
-    feed.style.display = 'none';
-    return;
-  }
-  feed.style.display = 'block';
-  feed.innerHTML = feedLines
-    .map((line) => {
-      const alpha = Math.min(1, line.ttl / 1000).toFixed(2);
-      return `<div style="opacity:${alpha}">${line.text}</div>`;
-    })
-    .join('');
-}
-
+/* Kill / turn feed — now the {@link KillFeed} module (M16 · t16d), constructed  */
+/* up with the other M16 UI; `killFeed.push(...)` / `killFeed.update(dt)` below. */
 /* -------------------------------------------------------------------------- */
 /* HUD overlay — the round-loop heads-up display (status panel + banner)        */
 /* -------------------------------------------------------------------------- */
@@ -898,6 +899,8 @@ window.addEventListener('keydown', (ev) => {
   if (ev.repeat) return;
   if (ev.code === 'KeyO') settingsMenu.toggle();
   else if (ev.code === 'KeyN') settings.set('minimap', !settings.get('minimap'));
+  // M16: `H` (or `?`) toggles the controls/help reference overlay.
+  else if (ev.code === 'KeyH' || ev.key === '?') helpOverlay.toggle();
 });
 window.addEventListener('keyup', (ev) => {
   if (ev.code === 'Tab') scoreboard.setVisible(false);
@@ -1360,7 +1363,7 @@ function animate(): void {
           cameraShake.addTrauma(traumaByProximity(x, z, entities));
         }
         audio.hit({ x, y, z }); // bat-hit impact at the victim
-        pushFeedLine(`#${ev.actorId ?? '?'} stunned #${ev.targetId ?? '?'} 🦇`);
+        killFeed.push(`#${ev.actorId ?? '?'} stunned #${ev.targetId ?? '?'} 🦇`);
         break;
       }
       case 'infect': {
@@ -1380,7 +1383,7 @@ function animate(): void {
         }
         audio.infect({ x, y, z }); // infection stinger at the victim
         audio.duck(); // dip music/ambient so the stinger reads (t12e)
-        pushFeedLine(`Player #${ev.targetId ?? '?'} was turned 🧟`);
+        killFeed.push(`Player #${ev.targetId ?? '?'} was turned 🧟`);
         break;
       }
       case 'roundStart': {
@@ -1432,7 +1435,7 @@ function animate(): void {
 
   // 6. Advance transient combat VFX and the turn feed, culling the expired.
   updateEffects(dtMs);
-  updateFeed(dtMs);
+  killFeed.update(dtMs);
 
   // 6b. Ripple the lake surface (M9 · t9d) — a cheap UV scroll, no allocations.
   water?.update(dtMs);
@@ -1485,8 +1488,8 @@ function animate(): void {
     stamina: localStamina(entities),
     ready: localReady,
     lookHint: controls.pointerLocked
-      ? 'mouse: look (Esc releases)'
-      : 'click canvas to look',
+      ? 'Esc: menu · H: controls'
+      : 'click to look · H: controls',
   });
 
   // M14: reset renderer.info once here (autoReset is off, see setup) so it
@@ -1528,4 +1531,9 @@ window.addEventListener('beforeunload', () => {
   settingsMenu.dispose();
   unsubscribeSettings();
   settings.dispose();
+  // M16: free the menus & onboarding overlays.
+  titleScreen.dispose();
+  helpOverlay.dispose();
+  pauseMenu.dispose();
+  killFeed.dispose();
 });
