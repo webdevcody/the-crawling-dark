@@ -47,9 +47,11 @@ Then open the client URL that Vite prints (default http://localhost:5173).
 
 Development is tracked as milestones on GitHub. **M0 → M7** build the playable game
 (scaffold, networking, movement, combat/infection, AI, round loop, prediction, netcode);
-**M8 → M15** are the Phase 2 polish batches (movement feel, world/environment, textures,
-sky/lighting, audio, characters, VFX/post-processing, and — M15 — the HUD & UX layer:
-a radar minimap, a Tab scoreboard, a persisted settings menu, and a combat reticle).
+**M8 → M16** are the Phase 2 polish batches (movement feel, world/environment, textures,
+sky/lighting, audio, characters, VFX/post-processing, the HUD & UX layer — a radar
+minimap, a Tab scoreboard, a persisted settings menu, and a combat reticle — and,
+in M16, the Menus & Onboarding pass: a title/start screen, a `H`/`?` controls
+reference, an `Esc` pause menu, and the kill/turn feed as its own module).
 M0 (the scaffold) proves the toolchain end-to-end: a pnpm monorepo, a Vite + Three.js
 client rendering a lit ground plane, a `ws` server logging connections, and a `shared/`
 package both sides consume.
